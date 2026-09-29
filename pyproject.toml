@@ -1,0 +1,76 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "neo4j-graphrag-haystack"
+version = "0.1.0"
+description = "Haystack retriever component for existing Neo4j graphs, built on the official neo4j-graphrag retrievers (vector, vector_cypher, hybrid, hybrid_cypher)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "neo4j-labs" }]
+keywords = ["haystack", "neo4j", "graphrag", "rag", "retriever", "knowledge-graph"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+# Only what the component itself needs. Embedders (sentence-transformers, OpenAI, ...) are
+# chosen and installed by the user.
+dependencies = [
+  "haystack-ai>=3.0",
+  "neo4j-graphrag>=1.18",
+  "neo4j>=5.17",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+# Only needed to run the integration tests / example notebook with a local embedder.
+integration = ["pytest", "sentence-transformers-haystack"]
+lint = ["ruff"]
+
+[project.urls]
+Source = "https://github.com/neo4j-labs/neo4j-haystack"
+Issues = "https://github.com/neo4j-labs/neo4j-haystack/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/haystack_integrations"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+markers = [
+  "integration: tests that need network access to the public Neo4j demo database",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+extend-exclude = ["examples", "*.md"]
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "W",   # pycodestyle warnings
+  "F",   # pyflakes
+  "I",   # isort
+  "B",   # flake8-bugbear
+  "UP",  # pyupgrade
+  "S",   # flake8-bandit (security)
+  "PL",  # pylint
+  "RUF", # ruff-specific
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["haystack_integrations"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*" = ["S101", "S603", "PLR2004", "PLC0415"]
