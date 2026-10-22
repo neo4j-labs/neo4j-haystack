@@ -3,15 +3,15 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "neo4j-graphrag-haystack"
+name = "haystack-neo4j"
 version = "0.1.0"
-description = "Haystack retriever component for existing Neo4j graphs, built on the official neo4j-graphrag retrievers (vector, vector_cypher, hybrid, hybrid_cypher)."
+description = "Neo4j integration for Haystack: GraphRAG retrieval over existing Neo4j graphs, with document store and agent memory components to follow."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "neo4j-labs" }]
-keywords = ["haystack", "neo4j", "graphrag", "rag", "retriever", "knowledge-graph"]
+keywords = ["haystack", "neo4j", "graphrag", "rag", "retriever", "knowledge-graph", "agent-memory"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "License :: OSI Approved :: MIT License",
@@ -23,18 +23,19 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
 ]
-# Only what the component itself needs. Embedders (sentence-transformers, OpenAI, ...) are
-# chosen and installed by the user.
+# The core needs only Haystack and the Neo4j driver. Feature-specific libraries are extras, and
+# embedders (sentence-transformers, OpenAI, ...) are chosen and installed by the user.
 dependencies = [
   "haystack-ai>=3.0",
-  "neo4j-graphrag>=1.18",
   "neo4j>=5.17",
 ]
 
 [project.optional-dependencies]
-test = ["pytest"]
-# Only needed to run the integration tests / example notebook with a local embedder.
-integration = ["pytest", "sentence-transformers-haystack"]
+graphrag = ["neo4j-graphrag>=1.18"]
+all = ["haystack-neo4j[graphrag]"]
+test = ["pytest", "haystack-neo4j[all]"]
+# Only needed to run the integration tests / example notebooks with a local embedder.
+integration = ["haystack-neo4j[test]", "sentence-transformers-haystack"]
 lint = ["ruff"]
 
 [project.urls]
@@ -71,6 +72,8 @@ select = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["haystack_integrations"]
+# Our subpackages are named `neo4j`; make sure the driver itself sorts as third-party.
+known-third-party = ["neo4j", "neo4j_graphrag"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*" = ["S101", "S603", "PLR2004", "PLC0415"]

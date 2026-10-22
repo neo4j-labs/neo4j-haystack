@@ -8,15 +8,21 @@ from typing import Any, Literal, get_args
 import neo4j
 from haystack import Document, component, default_from_dict, default_to_dict
 from haystack.core.serialization import component_to_dict
+from haystack.lazy_imports import LazyImport
 from haystack.utils import Secret, deserialize_component_inplace, deserialize_secrets_inplace
 
-from neo4j_graphrag.retrievers import (
-    HybridCypherRetriever,
-    HybridRetriever,
-    VectorCypherRetriever,
-    VectorRetriever,
-)
-from neo4j_graphrag.types import RetrieverResultItem
+from haystack_integrations.common.neo4j.utils import is_number_list, patch_cypher_version, to_json_safe
+
+_INSTALL_HINT = "Run 'pip install \"haystack-neo4j[graphrag]\"' to use Neo4jGraphRAGRetriever"
+
+with LazyImport(message=_INSTALL_HINT) as graphrag_import:
+    from neo4j_graphrag.retrievers import (
+        HybridCypherRetriever,
+        HybridRetriever,
+        VectorCypherRetriever,
+        VectorRetriever,
+    )
+    from neo4j_graphrag.types import RetrieverResultItem
 
 logger = logging.getLogger(__name__)
 
@@ -25,46 +31,6 @@ SEARCH_TYPES: tuple[str, ...] = get_args(SearchType)
 
 # Metadata key the result formatter uses to hand the converted Document back to ``run()``.
 _DOCUMENT_KEY = "__haystack_document__"
-
-
-def _is_number_list(value: Any) -> bool:
-    """True for non-empty lists of numbers, i.e. embedding vectors."""
-    return (
-        isinstance(value, (list, tuple))
-        and len(value) > 0
-        and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value)
-    )
-
-
-def _to_json_safe(value: Any) -> Any:
-    """Convert Neo4j driver values into JSON-serializable Python values."""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if hasattr(value, "iso_format"):  # neo4j.time.Date / DateTime / Time / Duration
-        return value.iso_format()
-    if isinstance(value, dict):
-        return {str(k): _to_json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_to_json_safe(v) for v in value]
-    if hasattr(value, "items") and callable(value.items):  # neo4j.graph.Node / Relationship
-        return {str(k): _to_json_safe(v) for k, v in value.items()}
-    return str(value)
-
-
-def _patch_cypher_version(driver: neo4j.Driver, version: str) -> None:
-    """
-    Prefix every query sent through ``driver.execute_query`` with ``CYPHER <version>``.
-
-    Only this driver instance is patched; the ``neo4j.Driver`` class is left untouched.
-    """
-    original = driver.execute_query
-
-    def execute_query(query: Any, *args: Any, **kwargs: Any) -> Any:
-        if isinstance(query, str) and not query.lstrip().upper().startswith("CYPHER"):
-            query = f"CYPHER {version} " + query
-        return original(query, *args, **kwargs)
-
-    driver.execute_query = execute_query  # type: ignore[method-assign]
 
 
 @component
@@ -86,7 +52,7 @@ class Neo4jGraphRAGRetriever:
 
     ```python
     from haystack.utils import Secret
-    from haystack_integrations.components.retrievers.neo4j_graphrag import Neo4jGraphRAGRetriever
+    from haystack_integrations.components.retrievers.neo4j import Neo4jGraphRAGRetriever
 
     retriever = Neo4jGraphRAGRetriever(
         url="neo4j+s://demo.neo4jlabs.com",
@@ -140,6 +106,8 @@ class Neo4jGraphRAGRetriever:
         :param cypher_version: If set (e.g. ``"25"``), prefixes the component's queries with
             ``CYPHER <version>``. Needed when the database defaults to an older Cypher version.
         """
+        graphrag_import.check()
+
         if search_type not in SEARCH_TYPES:
             msg = f"search_type must be one of {list(SEARCH_TYPES)}, got {search_type!r}."
             raise ValueError(msg)
@@ -218,7 +186,7 @@ class Neo4jGraphRAGRetriever:
             self.url, auth=(self.username.resolve_value(), self.password.resolve_value())
         )
         if self.cypher_version:
-            _patch_cypher_version(driver, self.cypher_version)
+            patch_cypher_version(driver, self.cypher_version)
 
         try:
             self._retriever = self._build_retriever(driver)
@@ -323,7 +291,7 @@ class Neo4jGraphRAGRetriever:
         metadata = item.metadata or {}
         if _DOCUMENT_KEY in metadata:
             return metadata[_DOCUMENT_KEY]
-        return Document(content=str(item.content), meta=_to_json_safe({k: v for k, v in metadata.items()}))
+        return Document(content=str(item.content), meta=to_json_safe({k: v for k, v in metadata.items()}))
 
     def _record_to_document(self, record: Any) -> Document:
         """Convert a Neo4j record (or a plain dict) into a Haystack Document."""
@@ -339,7 +307,7 @@ class Neo4jGraphRAGRetriever:
             props = dict(node.items()) if node is not None and hasattr(node, "items") else {}
             # Drop embeddings. neo4j-graphrag nulls out the indexed one (e.g. `embedding_sbert: None`);
             # Neo4j properties are never null, so a None here is always such a placeholder.
-            props = {k: v for k, v in props.items() if v is not None and not _is_number_list(v)}
+            props = {k: v for k, v in props.items() if v is not None and not is_number_list(v)}
             content = props.pop(self.text_field, None)
             meta = props
             if data.get("nodeLabels") is not None:
@@ -352,7 +320,7 @@ class Neo4jGraphRAGRetriever:
         if content is not None and not isinstance(content, str):
             content = str(content)
 
-        return Document(content=content, meta=_to_json_safe(meta), score=score)
+        return Document(content=content, meta=to_json_safe(meta), score=score)
 
     # ------------------------------------------------------------------ serialization
 

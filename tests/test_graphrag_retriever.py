@@ -13,10 +13,10 @@ from haystack.tools import ComponentTool
 from haystack.utils import Secret
 from neo4j_graphrag.types import RetrieverResult
 
-from haystack_integrations.components.retrievers.neo4j_graphrag import Neo4jGraphRAGRetriever
-from haystack_integrations.components.retrievers.neo4j_graphrag.retriever import _patch_cypher_version
+from haystack_integrations.common.neo4j.utils import patch_cypher_version
+from haystack_integrations.components.retrievers.neo4j import Neo4jGraphRAGRetriever
 
-MODULE = "haystack_integrations.components.retrievers.neo4j_graphrag.retriever"
+MODULE = "haystack_integrations.components.retrievers.neo4j.graphrag_retriever"
 RETRIEVAL_QUERY = "WITH node AS chunk, score RETURN chunk.text AS text, chunk.id AS chunk_id, score"
 EMBEDDING = [0.1, 0.2, 0.3]
 
@@ -160,7 +160,7 @@ class TestSerialization:
         pipeline.add_component("retriever", make_retriever("vector_cypher", database="companies"))
         yaml_str = pipeline.dumps()
         assert "super-secret-password" not in yaml_str
-        assert "haystack_integrations.components.retrievers.neo4j_graphrag" in yaml_str
+        assert "haystack_integrations.components.retrievers.neo4j" in yaml_str
 
         loaded = Pipeline.loads(yaml_str)
         retriever = loaded.get_component("retriever")
@@ -388,7 +388,7 @@ class TestCypherVersion:
         class_method_before = neo4j.Driver.execute_query
         driver, inner = self._driver_with_mock()
         try:
-            _patch_cypher_version(driver, "25")
+            patch_cypher_version(driver, "25")
             assert driver.execute_query("MATCH (n) RETURN n", {"a": 1}, database_="db") == "result"
             inner.assert_called_once_with("CYPHER 25 MATCH (n) RETURN n", {"a": 1}, database_="db")
 
@@ -406,7 +406,7 @@ class TestCypherVersion:
     def test_never_double_prefixes(self, query):
         driver, inner = self._driver_with_mock()
         try:
-            _patch_cypher_version(driver, "25")
+            patch_cypher_version(driver, "25")
             driver.execute_query(query)
             inner.assert_called_once_with(query)
         finally:
@@ -456,3 +456,24 @@ class TestComponentTool:
         assert embedder.run_calls == ["AI investments"]
         assert "documents" in result
         classes["vector"].return_value.search.assert_called_once()
+
+
+# ---------------------------------------------------------------- optional extra
+
+
+def test_missing_graphrag_extra_gives_install_hint():
+    """Without neo4j-graphrag, importing works and creating the retriever names the extra to install."""
+    import subprocess
+    import sys
+
+    script = (
+        "import sys; sys.modules['neo4j_graphrag'] = None\n"
+        "from haystack_integrations.components.retrievers.neo4j import Neo4jGraphRAGRetriever\n"
+        "try:\n"
+        "    Neo4jGraphRAGRetriever(url='bolt://x', vector_index_name='v')\n"
+        "except ImportError as e:\n"
+        "    print(e)\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    assert 'pip install "haystack-neo4j[graphrag]"' in proc.stdout

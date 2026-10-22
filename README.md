@@ -1,13 +1,43 @@
-# neo4j-haystack
+# haystack-neo4j
 
 > This is an experimental Neo4j Labs project and not part of Neo4j's supported product lineup. See the [Neo4j Labs disclaimer](./LABS_DISCLAIMER.txt).
-Haystack 3.0 with Neo4j Integration (WIP)
 
+The [Neo4j](https://neo4j.com/) integration for [Haystack](https://haystack.deepset.ai/) 3: one package for
+retrieval from existing Neo4j graphs, document storage, and agent memory. Install only the parts you need.
 
-A [Haystack](https://haystack.deepset.ai/) 3.0 retriever component for **existing** Neo4j graphs, built on
-Neo4j's official [`neo4j-graphrag`](https://github.com/neo4j/neo4j-graphrag-python) retrievers.
+## Components
 
-`Neo4jGraphRAGRetriever` is one component that covers four search types:
+| Component | Import from | Extra | Status |
+| --- | --- | --- | --- |
+| `Neo4jGraphRAGRetriever` | `haystack_integrations.components.retrievers.neo4j` | `graphrag` | Available |
+| `Neo4jDocumentStore`, `Neo4jEmbeddingRetriever`, `Neo4jDynamicDocumentRetriever`, Cypher query reader/writer | `haystack_integrations.document_stores.neo4j`, `...components.retrievers.neo4j`, `...components.connectors.neo4j` | none (core) | Planned: port of the community [`neo4j-haystack`](https://github.com/prosto/neo4j-haystack) components to Haystack 3 |
+| Agent memory store, retriever and writer | `haystack_integrations.memory_stores.neo4j`, `...components.retrievers.neo4j`, `...components.writers.neo4j` | `memory` | Planned: built on [`neo4j-agent-memory`](https://pypi.org/project/neo4j-agent-memory/) |
+
+Every component lives under the `haystack_integrations` namespace, so pipelines that use them save to YAML and load
+back with Haystack's default settings.
+
+## Installation
+
+```bash
+pip install haystack-neo4j                   # core: haystack-ai + the neo4j driver
+pip install "haystack-neo4j[graphrag]"       # + neo4j-graphrag, for Neo4jGraphRAGRetriever
+pip install "haystack-neo4j[all]"            # every optional feature
+pip install -e ".[all]"                      # from a clone
+```
+
+The package doesn't pick an embedding model for you. Install the Haystack text embedder that matches your index,
+for example:
+
+```bash
+pip install sentence-transformers-haystack   # local models such as all-MiniLM-L6-v2
+# or use haystack's built-in OpenAITextEmbedder / AzureOpenAITextEmbedder
+```
+
+## GraphRAG retriever
+
+`Neo4jGraphRAGRetriever` searches an **existing** Neo4j graph and its existing indexes, using Neo4j's official
+[`neo4j-graphrag`](https://github.com/neo4j/neo4j-graphrag-python) retrievers. It never writes to the database.
+One component covers four search types:
 
 | `search_type` | neo4j-graphrag retriever | What it does |
 | --- | --- | --- |
@@ -16,34 +46,15 @@ Neo4j's official [`neo4j-graphrag`](https://github.com/neo4j/neo4j-graphrag-pyth
 | `hybrid` | `HybridRetriever` | Vector + full-text search |
 | `hybrid_cypher` | `HybridCypherRetriever` | Hybrid search, then a graph traversal given by your `retrieval_query` |
 
-It works in a `Pipeline` and as a tool for an `Agent` (via `ComponentTool`).
+It works in a `Pipeline` and as a tool for an `Agent` (via `ComponentTool`). Without the `graphrag` extra,
+creating it raises an error that names the install command.
 
-This package is not the same as the PyPI package `neo4j-haystack`, which stores and indexes its own
-documents. This one reads from the indexes and graph you already have and returns graph context in each
-`Document.meta`.
-
-## Installation
-
-```bash
-pip install neo4j-graphrag-haystack          # once published
-pip install -e .                             # from a clone
-```
-
-The only dependencies are `haystack-ai`, `neo4j-graphrag` and `neo4j`. The package doesn't pick an embedding
-model for you. Install the Haystack text embedder that matches your index, for example:
-
-```bash
-pip install sentence-transformers-haystack   # local models such as all-MiniLM-L6-v2
-# or use haystack's built-in OpenAITextEmbedder / AzureOpenAITextEmbedder
-```
-
-## Usage
+### Usage
 
 ```python
 import os
-from haystack.utils import Secret
 from haystack_integrations.components.embedders.sentence_transformers import SentenceTransformersTextEmbedder
-from haystack_integrations.components.retrievers.neo4j_graphrag import Neo4jGraphRAGRetriever
+from haystack_integrations.components.retrievers.neo4j import Neo4jGraphRAGRetriever
 
 os.environ.setdefault("NEO4J_USERNAME", "companies")
 os.environ.setdefault("NEO4J_PASSWORD", "companies")
@@ -138,7 +149,7 @@ pip install -e ".[lint]"
 ruff check . && ruff format --check .        # lint and formatting (ruff format . to fix)
 ```
 
-See [`examples/neo4j_graphrag_component.ipynb`](examples/neo4j_graphrag_component.ipynb) for a full walkthrough
+See [`examples/graphrag_retriever.ipynb`](examples/graphrag_retriever.ipynb) for a full walkthrough
 with a RAG pipeline and an agent.
 
 ## License

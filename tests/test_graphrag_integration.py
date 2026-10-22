@@ -14,7 +14,7 @@ import textwrap
 import pytest
 from haystack import Document, Pipeline
 
-from haystack_integrations.components.retrievers.neo4j_graphrag import Neo4jGraphRAGRetriever
+from haystack_integrations.components.retrievers.neo4j import Neo4jGraphRAGRetriever
 
 pytestmark = pytest.mark.integration
 
