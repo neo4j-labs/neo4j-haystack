@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "haystack-neo4j"
 version = "0.1.0"
-description = "Neo4j integration for Haystack: GraphRAG retrieval over existing Neo4j graphs, with document store and agent memory components to follow."
+description = "Neo4j integration for Haystack: GraphRAG retrieval over existing Neo4j graphs and short-term, long-term and reasoning agent memory."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -32,7 +32,10 @@ dependencies = [
 
 [project.optional-dependencies]
 graphrag = ["neo4j-graphrag>=1.18"]
-all = ["haystack-neo4j[graphrag]"]
+# neo4j-agent-memory is pre-1.0 and changes between minors: pin the minor, widen after the tests pass.
+memory = ["neo4j-agent-memory>=0.7,<0.8"]
+memory-gliner = ["neo4j-agent-memory[gliner]>=0.7,<0.8"]
+all = ["haystack-neo4j[graphrag,memory]"]
 test = ["pytest", "haystack-neo4j[all]"]
 # Only needed to run the integration tests / example notebooks with a local embedder.
 integration = ["haystack-neo4j[test]", "sentence-transformers-haystack"]
@@ -50,6 +53,7 @@ testpaths = ["tests"]
 addopts = "--strict-markers"
 markers = [
   "integration: tests that need network access to the public Neo4j demo database",
+  "neo4j: tests that need a local Neo4j 5 (see tests/test_memory_integration.py)",
 ]
 
 [tool.ruff]
