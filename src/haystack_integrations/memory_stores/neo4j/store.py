@@ -6,6 +6,7 @@ import asyncio
 import copy
 import json
 import logging as std_logging
+import os
 import weakref
 from collections.abc import Coroutine
 from typing import Any, TypeVar
@@ -61,7 +62,7 @@ class Neo4jMemoryStore:
         uri: Secret = Secret.from_env_var("NEO4J_URI"),  # noqa: B008
         username: Secret = Secret.from_env_var("NEO4J_USERNAME", strict=False),  # noqa: B008
         password: Secret = Secret.from_env_var("NEO4J_PASSWORD"),  # noqa: B008
-        database: str = "neo4j",
+        database: str | None = None,
         llm_model: str = "openai/gpt-5.4-mini",
         embedding_model: str = "openai/text-embedding-3-small",
         extraction: dict[str, Any] | None = None,
@@ -75,7 +76,9 @@ class Neo4jMemoryStore:
         :param uri: Neo4j URI as a ``Secret`` (e.g. ``bolt://localhost:7687``).
         :param username: Neo4j username as a ``Secret``. Defaults to ``neo4j`` when the variable is unset.
         :param password: Neo4j password as a ``Secret``.
-        :param database: Neo4j database name.
+        :param database: Neo4j database name. If ``None`` (default), the ``NEO4J_DATABASE`` environment variable is
+            used, else ``"neo4j"``. Hosted and shared Neo4j accounts often may only use their own database, so set
+            this (or ``NEO4J_DATABASE``) to that database's name.
         :param llm_model: Provider string for extraction, e.g. ``"openai/gpt-5.4-mini"``.
         :param embedding_model: Provider string for embeddings, e.g. ``"openai/text-embedding-3-small"``.
         :param extraction: ``neo4j-agent-memory`` ``ExtractionConfig`` fields. Defaults to
@@ -120,7 +123,7 @@ class Neo4jMemoryStore:
                 uri=self.uri.resolve_value(),
                 username=self.username.resolve_value() or "neo4j",
                 password=SecretStr(self.password.resolve_value() or ""),
-                database=self.database,
+                database=self.database_name,
             ),
             llm=self.llm_model,
             embedding=self.embedding_model,
@@ -128,6 +131,40 @@ class Neo4jMemoryStore:
             resolution=ResolutionConfig(**(self.resolution or {})),
             memory=MemoryConfig(**(self.memory or {})),
         )
+
+    @property
+    def database_name(self) -> str:
+        """The database the store connects to: ``database``, else ``NEO4J_DATABASE``, else ``"neo4j"``."""
+        return self.database or os.environ.get("NEO4J_DATABASE") or "neo4j"
+
+    def _explain(self, error: Exception) -> Exception:
+        """Turn Neo4j's permission errors on first connect into a message that says what to change."""
+        text = str(error)
+        if "ACCESS on database" in text:
+            msg = (
+                f"Neo4j refused access to database {self.database_name!r} for this user. Set the database your user "
+                "can use with Neo4jMemoryStore(database=...) or the NEO4J_DATABASE environment variable. "
+                f"Neo4j said: {text}"
+            )
+            return PermissionError(msg)
+        if "IndexAlreadyExists" in text or "conflicts with existing index" in text:
+            msg = (
+                f"Database {self.database_name!r} already has an index where neo4j-agent-memory needs a uniqueness "
+                "constraint, usually because another application or memory system set up its own schema there. "
+                "Use an empty database for agent memory (Neo4jMemoryStore(database=...) or NEO4J_DATABASE), or, if "
+                "nothing uses the conflicting indexes, drop them and connect again. List them with: SHOW INDEXES "
+                "YIELD name, labelsOrTypes, properties, owningConstraint WHERE owningConstraint IS NULL. "
+                f"Neo4j said: {text}"
+            )
+            return RuntimeError(msg)
+        if "Forbidden" in text or "not allowed" in text:
+            msg = (
+                "On first connect, neo4j-agent-memory creates the constraints and indexes it needs, and Neo4j refused "
+                f"that for this user on database {self.database_name!r}. Use a user with schema (index and "
+                f"constraint) privileges, or connect once as one to create them. Neo4j said: {text}"
+            )
+            return PermissionError(msg)
+        return error
 
     def _create_client(self) -> Any:
         """
@@ -148,7 +185,17 @@ class Neo4jMemoryStore:
             if self._client is None:
                 std_logging.getLogger("neo4j.notifications").setLevel(std_logging.ERROR)
                 client = self._create_client()
-                await client.connect()
+                try:
+                    await client.connect()
+                except Exception as error:
+                    try:
+                        await client.close()
+                    except Exception:  # noqa: S110 - best effort; the connect error is the one to report
+                        pass
+                    explained = self._explain(error)
+                    if explained is error:
+                        raise
+                    raise explained from error
                 self._client = client
         return self._client
 

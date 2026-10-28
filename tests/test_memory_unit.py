@@ -773,3 +773,56 @@ class TestSharedEmbedder:
 
         shared = _SharedEmbedder(CountingEmbedder())
         assert adapt_to_legacy_embedder(shared) is shared  # kept as-is, not rejected or re-wrapped
+
+
+# ---------------------------------------------------------------- database selection and permission errors
+
+
+class TestDatabase:
+    def test_database_from_argument_env_or_default(self, monkeypatch):
+        monkeypatch.delenv("NEO4J_DATABASE", raising=False)
+        assert Neo4jMemoryStore().database_name == "neo4j"
+        monkeypatch.setenv("NEO4J_DATABASE", "tenant_db")
+        assert Neo4jMemoryStore().database_name == "tenant_db"
+        assert Neo4jMemoryStore()._settings().neo4j.database == "tenant_db"
+        assert Neo4jMemoryStore(database="explicit").database_name == "explicit"
+
+    def test_env_database_is_not_baked_into_yaml(self, monkeypatch):
+        monkeypatch.setenv("NEO4J_DATABASE", "tenant_db")
+        assert Neo4jMemoryStore().to_dict()["init_parameters"]["database"] is None
+
+    def _store_failing_with(self, store, message):
+        client = SimpleNamespace(connect=AsyncMock(side_effect=RuntimeError(message)), close=AsyncMock())
+        store._create_client = lambda: client
+        return client
+
+    def test_access_denied_names_the_database_setting(self, store):
+        client = self._store_failing_with(
+            store,
+            "Failed to create constraint conversation_id: {neo4j_code: Neo.ClientError.Security.Forbidden} "
+            "{message: ACCESS on database 'neo4j' is not allowed for user 'u' with roles [PUBLIC, t_rw].}",
+        )
+        store.strict = True
+        with pytest.raises(PermissionError, match="NEO4J_DATABASE"):
+            Neo4jMemoryRetriever(store).run(query="q", session_id="s")
+        client.close.assert_awaited()  # the half-open client is closed
+
+    def test_schema_privileges_hint(self, store):
+        self._store_failing_with(store, "Neo.ClientError.Security.Forbidden: Schema operations are not allowed")
+        with pytest.raises(PermissionError, match="schema"):
+            store.warm_up()
+
+    def test_other_errors_pass_through(self, store):
+        self._store_failing_with(store, "connection refused")
+        with pytest.raises(RuntimeError, match="connection refused"):
+            store.warm_up()
+
+    def test_conflicting_index_explains_the_options(self, store):
+        self._store_failing_with(
+            store,
+            "Failed to create constraint conversation_id: {neo4j_code: Neo.ClientError.Schema.IndexAlreadyExists} "
+            "{message: There already exists an index (:Conversation {id}).}",
+        )
+        with pytest.raises(RuntimeError, match="empty database") as info:
+            store.warm_up()
+        assert "SHOW INDEXES" in str(info.value) and "IndexAlreadyExists" in str(info.value)
