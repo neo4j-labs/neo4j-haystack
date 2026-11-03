@@ -7,6 +7,7 @@ from typing import Any
 
 from haystack.dataclasses import ChatMessage, ChatRole, ToolCallResult
 
+from haystack_integrations.memory_stores.neo4j import _short_term
 from haystack_integrations.memory_stores.neo4j._convert import one_line, result_text
 from haystack_integrations.memory_stores.neo4j.config import RecallConfig
 
@@ -25,8 +26,12 @@ _ERROR_KINDS = "MATCH (t:ReasoningTrace) WHERE t.id IN $ids RETURN t.id AS id, t
 
 
 async def recall_traces(client: Any, query: str, config: RecallConfig) -> list[dict[str, Any]]:
-    """Similar past tasks, with the tools they used and, for failed ones, why they failed."""
-    if config.trace_limit <= 0:
+    """
+    Similar past tasks, with the tools they used and, for failed ones, why they failed.
+
+    NAMS has no similar-task search, so nothing is recalled there.
+    """
+    if config.trace_limit <= 0 or _short_term.is_nams(client):
         return []
     traces = await client.reasoning.get_similar_traces(
         query,
@@ -127,6 +132,9 @@ async def record_trace(  # noqa: PLR0913
 
     Every turn is recorded, failed ones included: the outcome stores why it failed (``error_kind``) and how many
     tool calls failed, and each failed tool call keeps its error.
+
+    On NAMS only the steps and tool calls are stored (per conversation); NAMS keeps no trace record with the task,
+    outcome or success, so the returned id is the client's own.
     """
     from neo4j_agent_memory import ToolCallStatus  # noqa: PLC0415
     from neo4j_agent_memory.memory.reasoning import TraceOutcome  # noqa: PLC0415

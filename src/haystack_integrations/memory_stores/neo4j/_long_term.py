@@ -28,21 +28,30 @@ def _similarity(item: Any) -> float | None:
 
 
 async def recall(client: Any, query: str, config: RecallConfig) -> dict[str, list[dict[str, Any]]]:
-    """Preferences, entities and facts relevant to ``query``, with similarity scores."""
+    """
+    Preferences, entities and facts relevant to ``query``, with similarity scores.
+
+    NAMS stores neither preferences nor facts, and ranks entities itself (no threshold): only entities are read.
+    """
     lt = client.long_term
+    nams = _short_term.is_nams(client)
 
     async def none() -> list[Any]:
         return []
 
     preferences, entities, facts = await asyncio.gather(
         lt.search_preferences(query, limit=config.preference_limit, threshold=config.preference_threshold)
-        if config.preference_limit
+        if config.preference_limit and not nams
         else none(),
-        lt.search_entities(query, limit=config.entity_limit, threshold=config.entity_threshold)
+        (
+            lt.search_entities(query, limit=config.entity_limit)
+            if nams
+            else lt.search_entities(query, limit=config.entity_limit, threshold=config.entity_threshold)
+        )
         if config.entity_limit
         else none(),
         lt.search_facts(query, limit=config.fact_limit, threshold=config.fact_threshold)
-        if config.include_facts and config.fact_limit
+        if config.include_facts and config.fact_limit and not nams
         else none(),
     )
     return {
@@ -239,6 +248,11 @@ async def write_with_policy(  # noqa: PLR0913
 
     def tag(entities: list[dict[str, str]], source: str) -> list[dict[str, str]]:
         return [{**e, "source": source, "role": role} for e in entities]
+
+    if _short_term.is_nams(client):
+        # NAMS extracts entities server-side, in the background, for every message; extraction modes don't apply.
+        message = await _short_term.add_message(client, session_id, role, text, extraction_mode="auto", user_id=user_id)
+        return message, []
 
     if mode == "skip":
         message = await _short_term.add_message(client, session_id, role, text, extraction_mode="skip", user_id=user_id)

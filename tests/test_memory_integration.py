@@ -459,3 +459,93 @@ def test_one_read_embeds_the_query_once(store):
     new_calls = embedder.calls[len(before) :]
     # preferences, entities, facts and traces all search with one shared embedding
     assert new_calls == [query]
+
+
+# ---------------------------------------------------------------- saving memory directly through the store
+
+
+def test_store_add_messages_saves_short_term(store, cypher):
+    s = sid()
+    out = store.add_messages(
+        s,
+        [
+            ChatMessage.from_system("not stored"),
+            ChatMessage.from_user("Northwind competes with Contoso"),
+            ChatMessage.from_assistant("Noted."),
+        ],
+        extraction_policy=ExtractionPolicy(user="auto", assistant="skip"),
+    )
+    assert out["messages_written"] == 2
+    assert {"Northwind", "Contoso"} <= {e["name"] for e in out["entities"]}
+    rows = cypher(
+        "MATCH (:Conversation {session_id: $s})-[:HAS_MESSAGE]->(m:Message) RETURN m.role AS role, m.content AS c "
+        "ORDER BY m.timestamp",
+        s=s,
+    )
+    assert rows == [{"role": "user", "c": "Northwind competes with Contoso"}, {"role": "assistant", "c": "Noted."}]
+    history = Neo4jMemoryRetriever(store, recall=RecallConfig(read_long_term=False, read_reasoning=False)).run(
+        query="next", session_id=s
+    )["history"]
+    assert [m.text for m in history] == ["Northwind competes with Contoso", "Noted."]
+
+
+def test_store_add_preference_fact_entity_save_long_term(store, cypher):
+    tag = uuid.uuid4().hex[:8]
+    pref_id = store.add_preference("region", f"Focus on Germany {tag}", context="investing")
+    fact_id = store.add_fact(f"Pravesh-{tag}", "works_at", "Northwind Capital")
+    entity = store.add_entity(f"Fabrikam-{tag}", "organization", description="A test company")
+
+    assert cypher("MATCH (p:Preference {id: $id}) RETURN p.category AS c, p.context AS x", id=pref_id) == [
+        {"c": "region", "x": "investing"}
+    ]
+    assert cypher("MATCH (f:Fact {id: $id}) RETURN f.predicate AS p, f.object AS o", id=fact_id) == [
+        {"p": "works_at", "o": "Northwind Capital"}
+    ]
+    assert (entity["name"], entity["type"]) == (f"Fabrikam-{tag}", "ORGANIZATION")
+    # Earlier runs left similar "Fabrikam-..." names, so the resolver may flag it; it is never merged into them.
+    assert entity["resolution"] in {"none", "flagged"}
+    assert cypher("MATCH (e:Entity {id: $id}) RETURN e.description AS d", id=entity["id"]) == [{"d": "A test company"}]
+
+    recalled = Neo4jMemoryRetriever(store, recall=OPEN_RECALL).run(
+        query=f"region: Focus on Germany {tag} (investing)", session_id=sid()
+    )
+    assert any(p["id"] == pref_id for p in recalled["memories"]["preferences"])
+
+
+def test_store_add_trace_saves_reasoning_including_failures(store, cypher):
+    tag = uuid.uuid4().hex[:8]
+    ok_call = ToolCall(tool_name="search_companies", arguments={"country": "DE"}, id="c1")
+    ok_id = store.add_trace(
+        sid(),
+        f"Find German AI companies {tag}",
+        [
+            ChatMessage.from_assistant(tool_calls=[ok_call]),
+            ChatMessage.from_tool('[{"name": "Aleph Alpha", "type": "ORGANIZATION"}]', origin=ok_call),
+            ChatMessage.from_assistant("Aleph Alpha."),
+        ],
+    )
+    bad_call = ToolCall(tool_name="search_companies", arguments={"country": "FR"}, id="c2")
+    bad_id = store.add_trace(
+        sid(),
+        f"Find French AI companies {tag}",
+        [
+            ChatMessage.from_assistant(tool_calls=[bad_call]),
+            ChatMessage.from_tool("HTTP 503", origin=bad_call, error=True),
+        ],
+    )
+    rows = cypher(
+        "MATCH (t:ReasoningTrace) WHERE t.id IN $ids "
+        "RETURN t.id AS id, t.success AS ok, t.error_kind AS kind, COUNT { (t)-[:HAS_STEP]->() } AS steps",
+        ids=[ok_id, bad_id],
+    )
+    by_id = {r["id"]: r for r in rows}
+    assert (by_id[ok_id]["ok"], by_id[ok_id]["kind"], by_id[ok_id]["steps"]) == (True, None, 1)
+    assert (by_id[bad_id]["ok"], by_id[bad_id]["kind"], by_id[bad_id]["steps"]) == (False, "tool_error", 1)
+
+
+def test_store_save_methods_raise_on_failure(monkeypatch):
+    monkeypatch.setenv("NEO4J_URI", "bolt://localhost:1")
+    lenient = Neo4jMemoryStore(extraction={"extractor_type": "none"})  # strict=False still raises for explicit saves
+    with pytest.raises(Exception):  # noqa: B017 - the driver's connection error type varies by version
+        lenient.add_fact("a", "b", "c")
+    lenient.close()

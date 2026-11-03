@@ -826,3 +826,73 @@ class TestDatabase:
         with pytest.raises(RuntimeError, match="empty database") as info:
             store.warm_up()
         assert "SHOW INDEXES" in str(info.value) and "IndexAlreadyExists" in str(info.value)
+
+
+# ---------------------------------------------------------------- saving memory directly through the store
+
+
+class TestStoreSaveMethods:
+    @pytest.mark.parametrize(
+        ("method", "args"),
+        [
+            ("add_preference", ("", "x")),
+            ("add_preference", ("region", "")),
+            ("add_fact", ("a", "", "c")),
+            ("add_entity", ("", "PERSON")),
+            ("add_entity", ("Bob", " ")),
+            ("add_trace", ("s", "  ")),
+        ],
+    )
+    def test_invalid_input_raises_before_connecting(self, store, method, args):
+        store._connected = AsyncMock(side_effect=AssertionError("must not connect"))
+        with pytest.raises(ValueError):
+            getattr(store, method)(*args)
+
+    def test_add_messages_maps_roles_and_skips_system_and_tool(self, store):
+        client = attach(store, fake_client())
+        call = ToolCall("t", {}, id="c")
+        out = store.add_messages(
+            "s",
+            [
+                ChatMessage.from_system("sys"),
+                ChatMessage.from_user("hi"),
+                ChatMessage.from_assistant(tool_calls=[call]),
+                ChatMessage.from_tool("{}", origin=call),
+                ChatMessage.from_assistant("hello"),
+            ],
+            extraction_policy=ExtractionPolicy(user="skip", assistant="skip"),
+            user_id="u",
+        )
+        calls = [
+            (c.args[1], c.args[2], c.kwargs["user_identifier"]) for c in client.short_term.add_message.await_args_list
+        ]
+        assert calls == [("user", "hi", "u"), ("assistant", "hello", "u")]
+        assert out == {"messages_written": 2, "entities": []}
+
+    def test_add_trace_uses_default_success_rule(self, store):
+        client = attach(store, fake_client())
+        trace_id = store.add_trace("s", "task", [ChatMessage.from_user("task"), ChatMessage.from_assistant("done")])
+        assert trace_id == str(client.reasoning.start_trace.return_value.id)
+        outcome = client.reasoning.complete_trace.await_args.kwargs["outcome"]
+        assert (outcome.success, outcome.summary) == (True, "done")
+
+    def test_add_entity_reports_deduplication(self, store):
+        client = attach(store, fake_client())
+        entity = SimpleNamespace(id="e1", name="Northwind Capital", type="ORGANIZATION")
+        dedup = SimpleNamespace(is_duplicate=True, action="merged", matched_entity_name="Northwind Capital")
+        client.long_term.add_entity = AsyncMock(return_value=(entity, dedup))
+        assert store.add_entity("Northwind", "organization") == {
+            "id": "e1",
+            "name": "Northwind Capital",
+            "type": "ORGANIZATION",
+            "resolution": "merged",
+            "matched": "Northwind Capital",
+        }
+        assert client.long_term.add_entity.await_args.args == ("Northwind", "ORGANIZATION")
+
+    def test_save_methods_raise_even_when_not_strict(self, store):
+        client = attach(store, fake_client())
+        client.long_term.add_fact = AsyncMock(side_effect=RuntimeError("write failed"))
+        assert store.strict is False
+        with pytest.raises(RuntimeError, match="write failed"):
+            store.add_fact("a", "b", "c")

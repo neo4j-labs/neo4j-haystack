@@ -60,6 +60,10 @@ class Neo4jMemoryWriter:
             raise ValueError(msg)
         self._store = store
         self.extraction_policy = extraction_policy or ExtractionPolicy()
+        if store.is_nams and extraction_policy is not None and extraction_policy != ExtractionPolicy():
+            logger.warning(
+                "backend='nams' extracts entities server-side for every message; the ExtractionPolicy is ignored."
+            )
         self.write_short_term = write_short_term
         self.record_reasoning = record_reasoning
 
@@ -145,12 +149,23 @@ class Neo4jMemoryWriter:
         except Exception as error:
             return self._fallback(error, progress)
 
-    @staticmethod
-    def _validate(preferences: Any, facts: Any, mentions: Any) -> None:
+    def _validate(self, preferences: Any, facts: Any, mentions: Any) -> None:
         # Invalid items are a caller bug: always raise, even when strict=False.
         _long_term.validate_preferences(preferences)
         _long_term.validate_facts(facts)
         _long_term.validate_mentions(mentions)
+        if self._store.is_nams:
+            ignored = [
+                name
+                for name, value in (("preferences", preferences), ("facts", facts), ("mentions", mentions))
+                if value
+            ]
+            if ignored:
+                logger.warning(
+                    "Ignoring writer inputs {ignored}: backend='nams' stores no preferences or facts and extracts "
+                    "entities itself. Use backend='bolt' for them.",
+                    ignored=ignored,
+                )
 
     @staticmethod
     def _progress() -> dict[str, Any]:
@@ -209,10 +224,10 @@ class Neo4jMemoryWriter:
                 progress["messages_written"] += 1
                 progress["entities"].extend(linked)
 
-        # 3. Explicit long-term writes.
-        if preferences:
+        # 3. Explicit long-term writes (bolt only: NAMS stores neither, see _validate).
+        if preferences and not self._store.is_nams:
             await _long_term.add_preferences(client, preferences, user_id)
-        if facts:
+        if facts and not self._store.is_nams:
             await _long_term.add_facts(client, facts)
 
         # 4. Reasoning trace, written in one go after the turn.

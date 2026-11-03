@@ -25,12 +25,29 @@ class _Row:
         self.id, self.role, self.content = row["id"], row["role"], row["content"]
 
 
+def is_nams(client: Any) -> bool:
+    """True when the client talks to the hosted Neo4j Agent Memory Service instead of Neo4j directly."""
+    return bool(getattr(client, "is_nams", False))
+
+
 async def read_history(client: Any, session_id: str, limit: int) -> list[ChatMessage]:
     """The session's ``limit`` most recent user and assistant messages, oldest first."""
     if limit <= 0:
         return []
-    rows = await client.query.cypher(_RECENT_MESSAGES, {"session_id": session_id, "limit": limit})
-    history = [to_chat_message(_Row(r)) for r in rows]
+    if is_nams(client):
+        # NAMS returns the newest messages itself. An unknown conversation id means no history yet.
+        from neo4j_agent_memory import NotFoundError  # noqa: PLC0415
+
+        try:
+            conversation = await client.short_term.get_conversation(session_id, limit=limit)
+        except NotFoundError:
+            return []
+        rows = conversation.messages[-limit:]
+    else:
+        rows = [
+            _Row(r) for r in await client.query.cypher(_RECENT_MESSAGES, {"session_id": session_id, "limit": limit})
+        ]
+    history = [to_chat_message(r) for r in rows]
     return [m for m in history if m is not None]
 
 
