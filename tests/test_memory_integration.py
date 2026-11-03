@@ -73,7 +73,7 @@ def env(monkeypatch):
 
 @pytest.fixture
 def store():
-    s = Neo4jMemoryStore(extraction={"extractor_type": "none"})
+    s = Neo4jMemoryStore({"extraction": {"extractor_type": "none"}})
     yield s
     s.close()
 
@@ -182,17 +182,18 @@ def test_auto_mode_links_extractor_entities(store, cypher):
 def test_review_mode_filters_and_writes_relations_and_preferences(store, cypher):
     s = sid()
     text = "I prefer Northwind over Contoso for advertising, says Pravesh"
-    policy = ExtractionPolicy(user="review", assistant="skip", allowed_types=["ORGANIZATION"], min_confidence=0.5)
+    policy = ExtractionPolicy(user="review", assistant="skip", min_confidence=0.5)
     out = Neo4jMemoryWriter(store, extraction_policy=policy, record_reasoning="never").run(query=text, session_id=s)
 
-    assert sorted(e["name"] for e in out["entities"]) == ["Contoso", "Northwind"]
+    # Pravesh (confidence 0.3) is dropped; entity types would be limited by the extractor's entity_types.
+    assert sorted(e["name"] for e in out["entities"]) == ["Contoso", "Northwind", "advertising"]
     assert {e["source"] for e in out["entities"]} == {"review"}
     names = cypher(
         "MATCH (:Conversation {session_id: $s})-[:HAS_MESSAGE]->(m:Message)-[:MENTIONS]->(e:Entity) "
         "RETURN collect(e.name) AS n",
         s=s,
     )[0]["n"]
-    assert sorted(names) == ["Contoso", "Northwind"]  # PERSON (type) and "advertising" (type) were filtered out
+    assert sorted(names) == ["Contoso", "Northwind", "advertising"]
     rel = cypher(
         "MATCH (:Entity {name: 'Northwind'})-[r:RELATED_TO]->(:Entity {name: 'Contoso'}) "
         "WHERE r.extractor = 'reviewed' RETURN count(r) AS n"
@@ -426,7 +427,7 @@ def test_delete_session(store):
 
 def test_unreachable_database_degrades_unless_strict(monkeypatch):
     monkeypatch.setenv("NEO4J_URI", "bolt://localhost:1")
-    lenient = Neo4jMemoryStore(extraction={"extractor_type": "none"})
+    lenient = Neo4jMemoryStore({"extraction": {"extractor_type": "none"}})
     out = Neo4jMemoryRetriever(lenient, system_prompt="sys").run(query="hi", session_id="s")
     assert [m.text for m in out["messages"]] == ["sys", "hi"] and out["context"] == ""
     assert Neo4jMemoryWriter(lenient).run(query="hi", session_id="s") == {
@@ -436,7 +437,7 @@ def test_unreachable_database_degrades_unless_strict(monkeypatch):
     }
     lenient.close()
 
-    strict = Neo4jMemoryStore(extraction={"extractor_type": "none"}, strict=True)
+    strict = Neo4jMemoryStore({"extraction": {"extractor_type": "none"}}, strict=True)
     with pytest.raises(Exception):  # noqa: B017 - the driver's connection error type varies by version
         Neo4jMemoryRetriever(strict).run(query="hi", session_id="s")
     strict.close()
@@ -545,7 +546,58 @@ def test_store_add_trace_saves_reasoning_including_failures(store, cypher):
 
 def test_store_save_methods_raise_on_failure(monkeypatch):
     monkeypatch.setenv("NEO4J_URI", "bolt://localhost:1")
-    lenient = Neo4jMemoryStore(extraction={"extractor_type": "none"})  # strict=False still raises for explicit saves
+    lenient = Neo4jMemoryStore(
+        {"extraction": {"extractor_type": "none"}}
+    )  # strict=False still raises for explicit saves
     with pytest.raises(Exception):  # noqa: B017 - the driver's connection error type varies by version
         lenient.add_fact("a", "b", "c")
     lenient.close()
+
+
+# ---------------------------------------------------------------- agent memory tools
+
+
+def test_agent_tools_store_and_recall_by_user(store, cypher):
+    from haystack.components.agents import Agent
+
+    from haystack_integrations.tools.neo4j import Neo4jMemoryRetrieverTool, Neo4jMemoryWriterTool
+
+    from .test_memory_tools import ScriptedChatGenerator
+
+    user = f"user-{uuid.uuid4().hex[:8]}"
+    tag = uuid.uuid4().hex[:6]
+    generator = ScriptedChatGenerator(
+        [
+            ChatMessage.from_assistant(
+                tool_calls=[
+                    ToolCall(
+                        "store_memory",
+                        {"memory_type": "preference", "category": "region", "preference": f"Germany {tag}"},
+                        id="c1",
+                    ),
+                    ToolCall(
+                        "store_memory",
+                        {"memory_type": "entity", "name": f"Northwind-{tag}", "entity_type": "ORGANIZATION"},
+                        id="c2",
+                    ),
+                ]
+            ),
+            ChatMessage.from_assistant(tool_calls=[ToolCall("retrieve_memories", {}, id="c3")]),
+            ChatMessage.from_assistant("Done."),
+        ]
+    )
+    agent = Agent(
+        chat_generator=generator,
+        tools=[Neo4jMemoryRetrieverTool(memory_store=store), Neo4jMemoryWriterTool(memory_store=store)],
+        state_schema={"session_id": {"type": str}, "user_id": {"type": str}},
+    )
+    result = agent.run(messages=[ChatMessage.from_user("I focus on Germany.")], session_id=sid(), user_id=user)
+
+    results = [r.result for m in result["messages"] for r in m.tool_call_results]
+    assert results[:2] == [
+        f"Stored preference [region] Germany {tag}.",
+        f"Stored entity Northwind-{tag} (ORGANIZATION).",
+    ]
+    assert f"- [region] Germany {tag}" in results[2]  # recalled for this user, without a query
+    linked = cypher("MATCH (:User {identifier: $u})--(p:Preference) RETURN collect(p.preference) AS prefs", u=user)
+    assert linked[0]["prefs"] == [f"Germany {tag}"]

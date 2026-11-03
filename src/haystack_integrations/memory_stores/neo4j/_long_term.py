@@ -150,12 +150,8 @@ async def _linked_entities(client: Any, message: Any) -> list[dict[str, str]]:
 
 
 def _filter_proposal(proposal: Any, policy: ExtractionPolicy) -> Any:
-    allowed = {t.upper() for t in policy.allowed_types} if policy.allowed_types is not None else None
-    entities = [
-        e
-        for e in proposal.entities
-        if e.confidence >= policy.min_confidence and (allowed is None or str(e.type).upper() in allowed)
-    ]
+    # Entity types are limited where the library extracts: settings["extraction"]["entity_types"].
+    entities = [e for e in proposal.entities if e.confidence >= policy.min_confidence]
     relations = [r for r in proposal.relations if r.confidence >= policy.min_confidence]
     return proposal.model_copy(update={"entities": entities, "relations": relations})
 

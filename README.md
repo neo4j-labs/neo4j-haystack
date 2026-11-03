@@ -12,6 +12,7 @@ retrieval from existing Neo4j graphs, document storage, and agent memory. Instal
 | `Neo4jGraphRAGRetriever` | `haystack_integrations.components.retrievers.neo4j` | `graphrag` | Available |
 | `Neo4jDocumentStore`, `Neo4jEmbeddingRetriever`, `Neo4jDynamicDocumentRetriever`, Cypher query reader/writer | `haystack_integrations.document_stores.neo4j`, `...components.retrievers.neo4j`, `...components.connectors.neo4j` | none (core) | Planned: port of the community [`neo4j-haystack`](https://github.com/prosto/neo4j-haystack) components to Haystack 3 |
 | `Neo4jMemoryStore`, `Neo4jMemoryRetriever`, `Neo4jMemoryWriter` (agent memory) | `haystack_integrations.memory_stores.neo4j`, `...components.retrievers.neo4j`, `...components.writers.neo4j` | `memory` | Available, built on [`neo4j-agent-memory`](https://pypi.org/project/neo4j-agent-memory/) |
+| `Neo4jMemoryRetrieverTool`, `Neo4jMemoryWriterTool` (agent memory as tools) | `haystack_integrations.tools.neo4j` | `memory` | Available |
 
 Every component lives under the `haystack_integrations` namespace, so pipelines that use them save to YAML and load
 back with Haystack's default settings.
@@ -208,20 +209,23 @@ Haystack only logs "Inputs ['writer'] were not matched" and the writer's extra i
 
 ### Backends: your Neo4j (bolt) or NAMS
 
-The store talks to memory in one of the two ways `neo4j-agent-memory` supports:
+The store is configured like the library's `MemoryClient`, with the same `MemorySettings` (or a dict of the same
+shape), and talks to memory in one of the two ways the library supports:
 
 ```python
-# bolt (default): connect to your own Neo4j database directly
-store = Neo4jMemoryStore()  # NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, NEO4J_DATABASE
+from neo4j_agent_memory import MemorySettings, NamsConfig
 
-# nams: the hosted Neo4j Agent Memory Service; memory appears in your NAMS workspace
-store = Neo4jMemoryStore(backend="nams")  # NAMS_API_KEY, NAMS_WORKSPACE_ID
+# bolt (default): your own Neo4j database. Connection from NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, NEO4J_DATABASE
+store = Neo4jMemoryStore()
+
+# nams: the hosted Neo4j Agent Memory Service; memory appears in your NAMS workspace. API key from NAMS_API_KEY
+store = Neo4jMemoryStore(MemorySettings(backend="nams", nams=NamsConfig(workspace_id="ws-123")))
 session_id = store.create_session(user_id="pravesh")  # NAMS assigns conversation ids
 ```
 
 | | `bolt` | `nams` |
 | --- | --- | --- |
-| Settings | `uri`, `username`, `password`, `database` | `nams_api_key` (`Secret`), `nams_workspace_id`, `nams_endpoint`, `nams={...}` for other `NamsConfig` fields |
+| Settings | `settings["neo4j"]` (`uri`, `username`, `database`); password via `password=Secret` | `settings["nams"]` (`workspace_id`, `endpoint`, `timeout`…); API key via `nams_api_key=Secret` |
 | Session ids | Any string | From `store.create_session()` |
 | Entity extraction | Your `ExtractionPolicy` | NAMS extracts server-side in the background; the policy is ignored |
 | Preferences, facts, relations | Yes | Not stored: skipped with a warning (NAMS has no endpoints for them), so the same pipeline runs on both backends |
@@ -278,7 +282,7 @@ and the assistant's answer:
 | Mode | What is linked | Who decides |
 | --- | --- | --- |
 | `auto` | Entities and relations from the extractor (no preferences) | The extractor |
-| `review` | Extracted entities that pass `allowed_types`, `min_confidence` and your `reviewer`; relations between kept entities; extracted preferences (`save_preferences`) | The extractor proposes, the policy approves |
+| `review` | Extracted entities that pass `min_confidence` and your `reviewer`; relations between kept entities; extracted preferences (`save_preferences`) | The extractor proposes, the policy approves |
 | `explicit` | Only the entities in the writer's `mentions` input (`{"name", "type"}` or `{"id"}`) | You |
 | `tool_results` (assistant only, default) | Objects with `name` and `type` in the turn's JSON tool results | The tools |
 | `skip` | Nothing | Nobody |
@@ -287,8 +291,43 @@ Defaults: `user="auto"`, `assistant="tool_results"`. A custom `reviewer` is save
 pipeline that uses one, its module must be on Haystack's deserialization allowlist
 (`HAYSTACK_DESERIALIZATION_ALLOWLIST`).
 
-The extractor itself is set on the store: `Neo4jMemoryStore(extraction={"extractor_type": ...})` with `"llm"`
-(default here, no model download), `"pipeline"` (spaCy, then GLiNER, then LLM), `"gliner"`, `"spacy"` or `"none"`.
+The extractor itself is set on the store, in the library's `ExtractionConfig`: which extractor (`"llm"`, the default
+here because it needs no model download; `"pipeline"`, spaCy then GLiNER then LLM; `"gliner"`, `"spacy"`, `"none"`)
+and which entity types it looks for:
+
+```python
+from neo4j_agent_memory import ExtractionConfig, MemorySettings
+
+store = Neo4jMemoryStore(MemorySettings(extraction=ExtractionConfig(extractor_type="llm", entity_types=["PERSON", "ORGANIZATION"])))
+```
+
+`ExtractionPolicy` then decides, per message, whether and how those results are saved.
+
+### Memory as agent tools
+
+Instead of reading and writing memory around every turn, let an `Agent` decide, as with Haystack's Mem0 tools:
+
+```python
+from haystack.components.agents import Agent
+from haystack.components.generators.chat import OpenAIChatGenerator
+from haystack_integrations.tools.neo4j import Neo4jMemoryRetrieverTool, Neo4jMemoryWriterTool
+
+agent = Agent(
+    chat_generator=OpenAIChatGenerator(model="gpt-5.4-mini"),
+    tools=[Neo4jMemoryRetrieverTool(memory_store=store), Neo4jMemoryWriterTool(memory_store=store)],
+    system_prompt="Call retrieve_memories at the start of each turn; call store_memory for durable preferences and facts.",
+    state_schema={"session_id": {"type": str}, "user_id": {"type": str}},
+)
+agent.run(messages=[ChatMessage.from_user("I only want B2B companies from now on.")], session_id=session_id, user_id="pravesh")
+```
+
+| Tool | The model passes | Does |
+| --- | --- | --- |
+| `retrieve_memories` | `query` (optional) | With a query: relevant preferences, entities, facts and past tasks. Without: the session's recent messages and the user's preferences |
+| `store_memory` | `memory_type` (`preference` / `fact` / `entity`) and its fields | Saves it; tells the model if something was missing or the backend can't store it (NAMS: preferences, facts) |
+
+`session_id` and `user_id` come from the agent's state (`inputs_from_state`), never from the model. Both tools save to
+YAML with the agent.
 
 ### Retriever outputs and writer inputs
 
@@ -340,11 +379,17 @@ stores the query and a `no_answer` trace.
 
 ### Configuration
 
-- `Neo4jMemoryStore(uri, username, password, database, llm_model, embedding_model, extraction, resolution, memory,
-  strict)`. Credentials are `Secret`s. `database` defaults to `NEO4J_DATABASE`, else `neo4j`: hosted and shared
-  accounts (such as Aura) often may only use their own database, so set it to that name; `extraction`, `resolution` and `memory` are the library's
-  `ExtractionConfig`, `ResolutionConfig` and `MemoryConfig` fields (e.g. `memory={"multi_tenant": True}`). Settings
-  are built explicitly, so `NAM_*` variables and `.env` files don't change behaviour.
+- `Neo4jMemoryStore(settings, *, uri, username, password, nams_api_key, embedder, extractor, strict)`, like
+  `MemoryClient(settings, embedder=, extractor=)`. `settings` is a `MemorySettings` or a dict with its sections
+  (`backend`, `neo4j`, `nams`, `embedding`, `llm`, `extraction`, `resolution`, `memory`, `search`, `schema_config`,
+  `geocoding`, `enrichment`); only what you set is kept and saved. Anything it leaves unset comes from the `Secret`
+  parameters and the environment (`NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`, `NEO4J_DATABASE`, `NAMS_API_KEY`,
+  `NAMS_WORKSPACE_ID`), then the library's defaults (which also read `NAM_*` variables). Hosted and shared accounts
+  (such as Aura) often may only use their own database: set `settings["neo4j"]["database"]` or `NEO4J_DATABASE`.
+- Secrets never go in `settings`: a saved store would contain them, so saving it raises an error that names the
+  `Secret` parameter to use. `embedder` and `extractor` objects (e.g. a Vertex AI embedder) work, but a store with
+  them can't be saved to YAML; use provider strings in `settings` (`"embedding": "openai/text-embedding-3-small"`)
+  for saveable pipelines.
 - `RecallConfig`: what the retriever reads (`read_short_term`, `read_long_term`, `read_reasoning`), limits and
   similarity thresholds (defaults 0.3 preferences, 0.4 entities and facts, 0.5 traces), `include_trace_tools`,
   `include_failed_traces`, and the Jinja2 `template` for `context`.
@@ -382,7 +427,8 @@ ruff check . && ruff format --check .        # lint and formatting (ruff format 
 ```
 
 Examples: [`examples/graphrag_retriever.ipynb`](examples/graphrag_retriever.ipynb) (RAG pipeline and agent) and
-[`examples/agent_memory.ipynb`](examples/agent_memory.ipynb) (all three memories in a chat pipeline).
+[`examples/neo4j_agent_memory.ipynb`](examples/neo4j_agent_memory.ipynb) (all three memories on bolt or NAMS: a chat
+pipeline, tools and reasoning, saving directly through the store, and memory as agent tools).
 
 ## License
 

@@ -39,18 +39,19 @@ class ExtractionPolicy:
     Modes, per role:
 
     - ``auto``: the configured extractor decides. Writes entities and relations, but no preferences.
-    - ``review``: the extractor proposes; entities are filtered by ``allowed_types`` and ``min_confidence``,
-      then passed to ``reviewer``. Approved entities, relations between them and (optionally) extracted
+    - ``review``: the extractor proposes; entities and relations below ``min_confidence`` are dropped, then the
+      rest goes to ``reviewer``. Approved entities, relations between them and (optionally) extracted
       preferences are written.
     - ``explicit``: only the entities passed in the writer's ``mentions`` input are linked.
     - ``tool_results`` (assistant only): entities named in tool results (JSON objects with ``name`` and
       ``type``) are linked. Nothing is extracted from the answer text.
     - ``skip``: the message is stored without entities.
 
+    Which entity types the extractor looks for is set on the store, as in the library:
+    ``settings["extraction"]["entity_types"]`` (e.g. ``["PERSON", "ORGANIZATION"]``).
+
     :param user: Mode for the user's message.
     :param assistant: Mode for the assistant's answer.
-    :param allowed_types: Review mode: entity types to keep (e.g. ``["PERSON", "ORGANIZATION"]``).
-        ``None`` keeps every type the extractor returns.
     :param min_confidence: Review mode: drop entities and relations below this confidence.
     :param save_relations: Review mode: write relations whose two endpoints were both kept.
     :param save_preferences: Review mode: write preferences the extractor found.
@@ -60,7 +61,6 @@ class ExtractionPolicy:
 
     user: UserExtraction = "auto"
     assistant: AssistantExtraction = "tool_results"
-    allowed_types: list[str] | None = None
     min_confidence: float = 0.0
     save_relations: bool = True
     save_preferences: bool = True

@@ -88,7 +88,7 @@ def nams(monkeypatch):
 
 @pytest.fixture
 def store(nams):
-    s = Neo4jMemoryStore(backend="nams", nams={"validate_on_connect": False})
+    s = Neo4jMemoryStore({"backend": "nams", "nams": {"validate_on_connect": False}})
     yield s
     s.close()
 
@@ -111,32 +111,43 @@ class TestConfiguration:
         assert settings.nams.workspace_id == "ws-123"
         assert settings.nams.validate_on_connect is False
 
-    def test_explicit_workspace_and_endpoint(self, nams):
-        s = Neo4jMemoryStore(backend="nams", nams_workspace_id="ws-9", nams_endpoint="https://nams.example/v1")
+    def test_memory_settings_with_nams_config(self, nams):
+        from neo4j_agent_memory import MemorySettings, NamsConfig
+
+        settings = MemorySettings(
+            backend="nams", nams=NamsConfig(workspace_id="ws-9", endpoint="https://nams.example/v1")
+        )
+        s = Neo4jMemoryStore(settings)
         assert (s._settings().nams.workspace_id, s._settings().nams.endpoint) == ("ws-9", "https://nams.example/v1")
+        assert s._settings().nams.api_key.get_secret_value() == "nams-secret-key"  # from the nams_api_key Secret
 
     def test_missing_api_key(self, monkeypatch):
         monkeypatch.delenv("NAMS_API_KEY", raising=False)
         with pytest.raises(ValueError, match="NAMS_API_KEY"):
-            Neo4jMemoryStore(backend="nams")._settings()
+            Neo4jMemoryStore({"backend": "nams"})._settings()
 
-    @pytest.mark.parametrize("kwargs", [{"backend": "http"}, {"nams": {"api_key": "x"}}, {"nams": {"headers": {}}}])
-    def test_invalid_configuration(self, kwargs):
-        with pytest.raises(ValueError):
-            Neo4jMemoryStore(**kwargs)
+    def test_invalid_backend(self):
+        with pytest.raises(ValueError, match="backend"):
+            Neo4jMemoryStore({"backend": "http"})
+
+    @pytest.mark.parametrize("nams_settings", [{"api_key": "plain-key"}, {"headers": {"Authorization": "Bearer x"}}])
+    def test_secrets_in_settings_cannot_be_saved(self, nams, nams_settings):
+        store = Neo4jMemoryStore({"backend": "nams", "nams": nams_settings})
+        with pytest.raises(ValueError, match="secret"):
+            store.to_dict()
 
     def test_invalid_nams_option(self):
         with pytest.raises(Exception, match="timeout"):  # pydantic ValidationError
-            Neo4jMemoryStore(backend="nams", nams={"timeout": "soon"})
+            Neo4jMemoryStore({"backend": "nams", "nams": {"timeout": "soon"}})
 
     def test_serialization_keeps_key_as_env_reference(self, store):
         data = store.to_dict()
         params = data["init_parameters"]
-        assert params["backend"] == "nams"
+        assert params["settings"] == {"backend": "nams", "nams": {"validate_on_connect": False}}
         assert params["nams_api_key"] == {"type": "env_var", "env_vars": ["NAMS_API_KEY"], "strict": False}
         assert "nams-secret-key" not in json.dumps(data)
         restored = Neo4jMemoryStore.from_dict(data)
-        assert restored.is_nams and restored.nams == {"validate_on_connect": False}
+        assert restored.is_nams and restored.settings["nams"] == {"validate_on_connect": False}
 
     def test_pipeline_yaml_round_trip(self, store):
         pipe = Pipeline()

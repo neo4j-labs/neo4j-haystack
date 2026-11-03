@@ -15,6 +15,7 @@ pytest.importorskip("neo4j_agent_memory")
 
 from haystack import Pipeline
 from haystack.dataclasses import ChatMessage, ToolCall
+from neo4j_agent_memory import ExtractorType
 from neo4j_agent_memory.extraction.base import ExtractedEntity, ExtractedPreference, ExtractedRelation, ExtractionResult
 from pydantic import ValidationError
 
@@ -161,7 +162,7 @@ class TestPolicies:
             ExtractionPolicy(**kwargs)
 
     def test_policy_round_trip_with_reviewer(self):
-        policy = ExtractionPolicy(user="review", allowed_types=["ORGANIZATION"], min_confidence=0.5, reviewer=keep_orgs)
+        policy = ExtractionPolicy(user="review", min_confidence=0.5, reviewer=keep_orgs)
         data = policy.to_dict()
         assert data["reviewer"] == f"{__name__}.keep_orgs"
         json.dumps(data)
@@ -308,14 +309,15 @@ class TestWriteWithPolicy:
             preferences=[ExtractedPreference(category="region", preference="Germany", confidence=0.9)],
         )
 
-    def test_review_filters_types_confidence_and_dangling_relations(self):
+    def test_review_filters_confidence_and_dangling_relations(self):
         extractor = SimpleNamespace(extract=AsyncMock(return_value=self.proposal()))
         client = fake_client(extractor=extractor, linked=[{"name": "Contoso", "type": "ORGANIZATION"}])
-        policy = ExtractionPolicy(user="review", allowed_types=["organization", "person"], min_confidence=0.5)
+        policy = ExtractionPolicy(user="review", min_confidence=0.5)
         self.write(client, "review", policy=policy)
 
         refs = client.short_term.add_message.await_args.kwargs["explicit_mentions"]
-        assert sorted(r.name for r in refs) == ["Contoso", "Northwind"]  # PERSON below confidence, OBJECT not allowed
+        # Pravesh (0.2) is below min_confidence. Types are limited by the extractor's entity_types, not here.
+        assert sorted(r.name for r in refs) == ["Contoso", "Northwind", "advertising"]
         client.long_term.add_relationship.assert_awaited_once()
         assert client.long_term.add_relationship.await_args.args[2] == "COMPETES_WITH"
         assert client.long_term.add_relationship.await_args.kwargs["extractor"] == "reviewed"
@@ -630,7 +632,7 @@ class TestWriter:
 class TestSerialization:
     def test_store_validates_library_config(self):
         with pytest.raises(ValidationError):
-            Neo4jMemoryStore(extraction={"extractor_type": "magic"})
+            Neo4jMemoryStore({"extraction": {"extractor_type": "magic"}})
 
     def test_store_settings_are_explicit(self, store, monkeypatch):
         monkeypatch.setenv("NAM_NEO4J__URI", "bolt://elsewhere:7687")
@@ -645,14 +647,14 @@ class TestSerialization:
         assert data["init_parameters"]["password"] == {
             "type": "env_var",
             "env_vars": ["NEO4J_PASSWORD"],
-            "strict": True,
+            "strict": False,
         }
         assert "super-secret-password" not in json.dumps(data)
 
     def test_store_round_trip_reuses_instance(self):
-        data = Neo4jMemoryStore(database="mem", memory={"multi_tenant": True}).to_dict()
+        data = Neo4jMemoryStore({"neo4j": {"database": "mem"}, "memory": {"multi_tenant": True}}).to_dict()
         first = Neo4jMemoryStore.from_dict(data)
-        assert first.database == "mem" and first.memory == {"multi_tenant": True}
+        assert first.settings == {"neo4j": {"database": "mem"}, "memory": {"multi_tenant": True}}
         assert Neo4jMemoryStore.from_dict(data) is first
         assert data["init_parameters"]["password"]["type"] == "env_var"  # input not mutated
 
@@ -785,11 +787,11 @@ class TestDatabase:
         monkeypatch.setenv("NEO4J_DATABASE", "tenant_db")
         assert Neo4jMemoryStore().database_name == "tenant_db"
         assert Neo4jMemoryStore()._settings().neo4j.database == "tenant_db"
-        assert Neo4jMemoryStore(database="explicit").database_name == "explicit"
+        assert Neo4jMemoryStore({"neo4j": {"database": "explicit"}}).database_name == "explicit"
 
     def test_env_database_is_not_baked_into_yaml(self, monkeypatch):
         monkeypatch.setenv("NEO4J_DATABASE", "tenant_db")
-        assert Neo4jMemoryStore().to_dict()["init_parameters"]["database"] is None
+        assert Neo4jMemoryStore().to_dict()["init_parameters"]["settings"] == {}
 
     def _store_failing_with(self, store, message):
         client = SimpleNamespace(connect=AsyncMock(side_effect=RuntimeError(message)), close=AsyncMock())
@@ -896,3 +898,70 @@ class TestStoreSaveMethods:
         assert store.strict is False
         with pytest.raises(RuntimeError, match="write failed"):
             store.add_fact("a", "b", "c")
+
+
+# ---------------------------------------------------------------- settings, as for MemoryClient
+
+
+class TestSettings:
+    def test_memory_settings_object_keeps_only_what_was_set(self):
+        from neo4j_agent_memory import ExtractionConfig, MemorySettings
+
+        store = Neo4jMemoryStore(MemorySettings(extraction=ExtractionConfig(extractor_type="spacy")))
+        assert store.settings == {"extraction": {"extractor_type": ExtractorType.SPACY}, "backend": "bolt"}
+        assert "llm" not in store.settings  # empty defaults the library marks as set are dropped
+        saved = store.to_dict()["init_parameters"]["settings"]
+        assert saved == {"extraction": {"extractor_type": "spacy"}, "backend": "bolt"}
+        assert Neo4jMemoryStore.from_dict(store.to_dict())._settings().extraction.extractor_type.value == "spacy"
+
+    def test_provider_object_is_saved_as_its_string(self):
+        from neo4j_agent_memory import MemorySettings
+
+        store = Neo4jMemoryStore(MemorySettings(embedding="openai/text-embedding-3-small"))
+        assert store.settings["embedding"] == "openai/text-embedding-3-small"  # readable, not a provider object
+        assert store.to_dict()["init_parameters"]["settings"]["embedding"] == "openai/text-embedding-3-small"
+
+    def test_settings_fill_from_secrets_and_env(self, monkeypatch):
+        monkeypatch.setenv("NEO4J_DATABASE", "tenant_db")
+        settings = Neo4jMemoryStore({"neo4j": {"uri": "neo4j+s://example:7687"}})._settings()
+        assert settings.neo4j.uri == "neo4j+s://example:7687"  # settings win
+        assert settings.neo4j.password.get_secret_value() == "super-secret-password"  # from the password Secret
+        assert settings.neo4j.database == "tenant_db"  # from the environment
+        assert settings.extraction.extractor_type.value == "llm"  # store default, no model download
+
+    @pytest.mark.parametrize(
+        ("settings", "match"),
+        [
+            ({"neo4j": {"password": "plain"}}, "password=Secret"),
+            ({"geocoding": {"api_key": "plain"}}, "NAM_"),
+        ],
+    )
+    def test_secret_in_settings_is_refused_when_saving(self, settings, match):
+        store = Neo4jMemoryStore(settings)
+        with pytest.raises(ValueError, match=match):
+            store.to_dict()
+
+    def test_embedder_and_extractor_objects_run_but_cannot_be_saved(self):
+        from tests.memory_fakes import FakeEmbedder, FakeExtractor
+
+        embedder, extractor = FakeEmbedder(), FakeExtractor()
+        store = Neo4jMemoryStore(embedder=embedder, extractor=extractor)
+        client = store._create_client()
+        assert client._embedder_override._inner is embedder
+        assert client._extractor_override is extractor
+        with pytest.raises(ValueError, match="embedder or extractor objects"):
+            store.to_dict()
+
+    @pytest.mark.parametrize(("settings", "error"), [("bolt", TypeError), ({"backend": "http"}, ValueError)])
+    def test_invalid_settings(self, settings, error):
+        with pytest.raises(error):
+            Neo4jMemoryStore(settings)
+
+    def test_legacy_embedding_config_is_built_by_the_library(self):
+        from neo4j_agent_memory import EmbeddingConfig, MemorySettings
+
+        store = Neo4jMemoryStore(
+            MemorySettings(embedding=EmbeddingConfig(provider="openai", model="text-embedding-3-small"))
+        )
+        client = store._create_client()
+        assert client._embedder_override is None  # no TypeError; the library creates the embedder on connect

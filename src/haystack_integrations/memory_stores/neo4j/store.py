@@ -26,15 +26,7 @@ from haystack_integrations.memory_stores.neo4j.config import ExtractionPolicy
 _INSTALL_HINT = "Run 'pip install \"haystack-neo4j[memory]\"' to use the Neo4j agent memory components"
 
 with LazyImport(message=_INSTALL_HINT) as memory_import:
-    from neo4j_agent_memory import (
-        ExtractionConfig,
-        MemoryClient,
-        MemoryConfig,
-        MemorySettings,
-        NamsConfig,
-        Neo4jConfig,
-        ResolutionConfig,
-    )
+    from neo4j_agent_memory import MemoryClient, MemorySettings
     from neo4j_agent_memory.embeddings.base import adapt_to_legacy_embedder
     from pydantic import SecretStr
 
@@ -42,114 +34,173 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 Backend = Literal["bolt", "nams"]
-# NamsConfig fields set through dedicated parameters; secrets must never go in the plain `nams` dict.
-_NAMS_RESERVED = {"api_key", "workspace_id", "endpoint", "headers"}
+
+# Secret fields of MemorySettings, and the store parameter that supplies each one instead.
+_SECRET_FIELDS: dict[tuple[str, str], str | None] = {
+    ("neo4j", "password"): "password",
+    ("nams", "api_key"): "nams_api_key",
+    ("nams", "headers"): None,
+    ("geocoding", "api_key"): None,
+    ("enrichment", "diffbot_api_key"): None,
+}
+# The library defaults to the "pipeline" extractor (spaCy, then GLiNER, then an LLM), which downloads models.
+# Without an `extraction` section, the store uses the LLM extractor instead, which needs no download.
+_DEFAULT_EXTRACTION = {"extractor_type": "llm"}
+# The library's default embedding model, as a provider string (its default object form is deprecated).
+_DEFAULT_EMBEDDING = "openai/text-embedding-3-small"
 
 # Pipeline YAML serializes the store once per component. Loading returns the live store for an identical
 # config, so a loaded pipeline shares one connection. Keys hold env-var names only, never secret values.
 _REGISTRY: weakref.WeakValueDictionary[str, Neo4jMemoryStore] = weakref.WeakValueDictionary()
 
 
+def _provider_string(value: Any) -> Any:
+    """The library turns "provider/model" strings into provider objects; recover the string where it can."""
+    if value is None or isinstance(value, (str, dict)) or hasattr(value, "model_dump"):
+        return value
+    model = getattr(value, "model", None)
+    return model if isinstance(model, str) and "/" in model else value
+
+
+def _settings_to_dict(settings: Any) -> dict[str, Any]:
+    """The settings the user set, as a dict: ``MemorySettings`` keeps only explicitly set fields."""
+    if settings is None:
+        return {}
+    if isinstance(settings, MemorySettings):
+        # The library's validators mark some sections as set with empty defaults (e.g. llm={}): drop those.
+        data = {k: v for k, v in settings.model_dump(exclude_unset=True).items() if v != {}}
+        for key in ("embedding", "llm"):
+            if key in data:
+                data[key] = _provider_string(data[key])
+        return data
+    if isinstance(settings, dict):
+        return {k: (dict(v) if isinstance(v, dict) else v) for k, v in settings.items()}
+    msg = f"settings must be a neo4j_agent_memory.MemorySettings or a dict, got {type(settings).__name__}."
+    raise TypeError(msg)
+
+
+def _is_set(value: Any) -> bool:
+    if value is None:
+        return False
+    if hasattr(value, "get_secret_value"):
+        return bool(value.get_secret_value())
+    return bool(value)
+
+
+def _settings_to_json(settings: dict[str, Any]) -> dict[str, Any]:
+    """Settings for YAML: secret values are refused, provider objects become their provider strings."""
+    for (section, field), param in _SECRET_FIELDS.items():
+        if _is_set((settings.get(section) or {}).get(field)):
+            where = f"settings[{section!r}][{field!r}]"
+            fix = (
+                f"pass it as {param}=Secret.from_env_var(...) and leave it out of settings"
+                if param
+                else "set it through the library's NAM_* environment variables instead"
+            )
+            msg = f"{where} holds a secret, which would be written to YAML in plain text. To save this store, {fix}."
+            raise ValueError(msg)
+
+    data = dict(settings)
+    for key in ("embedding", "llm"):
+        if key not in data:
+            continue
+        value = data[key] = _provider_string(data[key])
+        if value is not None and not isinstance(value, (str, dict)) and not hasattr(value, "model_dump"):
+            msg = f"settings[{key!r}] is a {type(value).__name__} object that cannot be saved; use a provider string."
+            raise ValueError(msg)
+
+    def default(value: Any) -> Any:
+        if hasattr(value, "model_dump"):
+            return value.model_dump(mode="json", exclude_unset=True)
+        if hasattr(value, "value"):  # enums
+            return value.value
+        msg = f"Cannot save a {type(value).__name__} in settings."
+        raise ValueError(msg)
+
+    return json.loads(json.dumps(data, default=default))
+
+
 class Neo4jMemoryStore:
     """
     Neo4j-backed short-term, long-term and reasoning memory, built on ``neo4j-agent-memory``.
 
-    Holds the connection and configuration. ``Neo4jMemoryRetriever`` and ``Neo4jMemoryWriter`` both take a
+    Configured like the library's ``MemoryClient``: pass a ``MemorySettings`` (or a dict of the same shape) and,
+    optionally, an ``embedder`` and ``extractor``. ``Neo4jMemoryRetriever`` and ``Neo4jMemoryWriter`` both take a
     store, so they share one connection. No network call is made until ``warm_up()`` or first use.
+
+    Credentials stay out of ``settings``: they come from ``Secret`` parameters (``password``, ``nams_api_key``), so
+    pipelines save to YAML with environment-variable names only. Anything ``settings`` leaves unset is filled from
+    those parameters and the environment (``NEO4J_URI``, ``NEO4J_USERNAME``, ``NEO4J_DATABASE``,
+    ``NAMS_WORKSPACE_ID``).
 
     Two backends, as in ``neo4j-agent-memory``:
 
-    - ``backend="bolt"`` (default): the library connects to your Neo4j database directly. All memory types.
-    - ``backend="nams"``: the library calls the hosted Neo4j Agent Memory Service (NAMS), which stores memory
-      in your workspace and extracts entities server-side. NAMS assigns session (conversation) ids: get one
-      with ``create_session()``. NAMS does not support preferences, facts, relations or similar-task recall.
+    - ``"bolt"`` (default): the library connects to your Neo4j database directly. All memory types.
+    - ``"nams"``: the library calls the hosted Neo4j Agent Memory Service (NAMS), which stores memory in your
+      workspace and extracts entities server-side. NAMS assigns session (conversation) ids: get one with
+      ``create_session()``. NAMS stores no preferences, facts or relations, and has no similar-task recall.
 
     Usage example:
 
     ```python
+    from neo4j_agent_memory import ExtractionConfig, MemorySettings, NamsConfig
     from haystack_integrations.memory_stores.neo4j import Neo4jMemoryStore
 
-    store = Neo4jMemoryStore()  # bolt: reads NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD
-    nams_store = Neo4jMemoryStore(backend="nams")  # reads NAMS_API_KEY, NAMS_WORKSPACE_ID
+    # bolt: connection from NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD / NEO4J_DATABASE
+    store = Neo4jMemoryStore(MemorySettings(extraction=ExtractionConfig(extractor_type="spacy")))
+
+    # NAMS: API key from NAMS_API_KEY
+    nams_store = Neo4jMemoryStore(MemorySettings(backend="nams", nams=NamsConfig(workspace_id="ws-123")))
     ```
     """
 
     def __init__(  # noqa: PLR0913
         self,
+        settings: MemorySettings | dict[str, Any] | None = None,
         *,
-        backend: Backend = "bolt",
-        uri: Secret = Secret.from_env_var("NEO4J_URI"),  # noqa: B008
+        uri: Secret = Secret.from_env_var("NEO4J_URI", strict=False),  # noqa: B008
         username: Secret = Secret.from_env_var("NEO4J_USERNAME", strict=False),  # noqa: B008
-        password: Secret = Secret.from_env_var("NEO4J_PASSWORD"),  # noqa: B008
-        database: str | None = None,
-        llm_model: str = "openai/gpt-5.4-mini",
-        embedding_model: str = "openai/text-embedding-3-small",
-        extraction: dict[str, Any] | None = None,
-        resolution: dict[str, Any] | None = None,
-        memory: dict[str, Any] | None = None,
+        password: Secret = Secret.from_env_var("NEO4J_PASSWORD", strict=False),  # noqa: B008
         nams_api_key: Secret = Secret.from_env_var("NAMS_API_KEY", strict=False),  # noqa: B008
-        nams_workspace_id: str | None = None,
-        nams_endpoint: str | None = None,
-        nams: dict[str, Any] | None = None,
+        embedder: Any | None = None,
+        extractor: Any | None = None,
         strict: bool = False,
     ) -> None:
         """
         Create the store. Settings are validated here; nothing connects until first use.
 
-        :param backend: ``"bolt"`` (direct Neo4j connection) or ``"nams"`` (hosted Neo4j Agent Memory Service).
-        :param uri: Neo4j URI as a ``Secret`` (e.g. ``bolt://localhost:7687``).
-        :param username: Neo4j username as a ``Secret``. Defaults to ``neo4j`` when the variable is unset.
-        :param password: Neo4j password as a ``Secret``.
-        :param database: Neo4j database name. If ``None`` (default), the ``NEO4J_DATABASE`` environment variable is
-            used, else ``"neo4j"``. Hosted and shared Neo4j accounts often may only use their own database, so set
-            this (or ``NEO4J_DATABASE``) to that database's name.
-        :param llm_model: Provider string for extraction, e.g. ``"openai/gpt-5.4-mini"``.
-        :param embedding_model: Provider string for embeddings, e.g. ``"openai/text-embedding-3-small"``.
-        :param extraction: ``neo4j-agent-memory`` ``ExtractionConfig`` fields. Defaults to
-            ``{"extractor_type": "llm"}``, which needs no model download. Other extractor types: ``"pipeline"``
-            (spaCy, GLiNER, then LLM), ``"gliner"``, ``"spacy"``, ``"none"``.
-        :param resolution: ``ResolutionConfig`` fields (entity de-duplication).
-        :param memory: ``MemoryConfig`` fields, e.g. ``{"multi_tenant": True}``.
-        :param nams_api_key: NAMS: API key as a ``Secret``. Defaults to the ``NAMS_API_KEY`` environment variable.
-        :param nams_workspace_id: NAMS: workspace id. If ``None``, the ``NAMS_WORKSPACE_ID`` environment variable.
-        :param nams_endpoint: NAMS: API endpoint. If ``None``, the library default (the hosted service).
-        :param nams: NAMS: other ``NamsConfig`` fields, e.g. ``{"timeout": 60, "validate_on_connect": False}``.
-            Not for credentials: ``api_key``, ``workspace_id``, ``endpoint`` and ``headers`` are rejected here.
+        :param settings: ``neo4j_agent_memory.MemorySettings``, or a dict with the same sections: ``backend``,
+            ``neo4j``, ``nams``, ``embedding``, ``llm``, ``extraction``, ``resolution``, ``memory``, ``search``,
+            ``schema_config``, ``geocoding``, ``enrichment``. Only what you set is kept. Without an ``extraction``
+            section the LLM extractor is used (the library's own default, ``"pipeline"``, downloads models).
+            Keep secrets out: use the parameters below.
+        :param uri: bolt: Neo4j URI as a ``Secret``, used when ``settings`` sets no ``neo4j.uri``.
+        :param username: bolt: Neo4j username as a ``Secret``, used when ``settings`` sets none. Default ``neo4j``.
+        :param password: bolt: Neo4j password as a ``Secret``.
+        :param nams_api_key: NAMS: API key as a ``Secret``.
+        :param embedder: Optional embedder object, as for ``MemoryClient(embedder=...)``. A store with one runs, but
+            cannot be saved to YAML; prefer a provider string in ``settings["embedding"]``.
+        :param extractor: Optional entity extractor object, as for ``MemoryClient(extractor=...)``. Same caveat.
         :param strict: If ``False`` (default), memory failures are logged and pipelines keep running.
             If ``True``, they raise.
         """
         memory_import.check()
-        if backend not in get_args(Backend):
-            msg = f"backend must be one of {list(get_args(Backend))}, got {backend!r}."
+        self.settings = _settings_to_dict(settings)
+        if self.backend not in get_args(Backend):
+            msg = f"settings['backend'] must be one of {list(get_args(Backend))}, got {self.backend!r}."
             raise ValueError(msg)
-        reserved = _NAMS_RESERVED & set(nams or {})
-        if reserved:
-            msg = (
-                f"Set {sorted(reserved)} through nams_api_key / nams_workspace_id / nams_endpoint, not the `nams` "
-                "dict (it is saved to YAML in plain text)."
-            )
-            raise ValueError(msg)
-        self.backend = backend
         self.uri = uri
         self.username = username
         self.password = password
-        self.database = database
-        self.llm_model = llm_model
-        self.embedding_model = embedding_model
-        self.extraction = extraction
-        self.resolution = resolution
-        self.memory = memory
         self.nams_api_key = nams_api_key
-        self.nams_workspace_id = nams_workspace_id
-        self.nams_endpoint = nams_endpoint
-        self.nams = nams
+        self.embedder = embedder
+        self.extractor = extractor
         self.strict = strict
+        if self.is_nams and (embedder is not None or extractor is not None):
+            logger.warning("NAMS embeds and extracts server-side; the embedder and extractor objects are not used.")
 
-        # Validate the library configs now, so a typo fails at construction and not mid-pipeline.
-        ExtractionConfig(**self._extraction_fields())
-        ResolutionConfig(**(resolution or {}))
-        MemoryConfig(**(memory or {}))
-        NamsConfig(**(nams or {}))
+        # Validate now, so a typo fails at construction and not mid-pipeline. Secrets are not read here.
+        MemorySettings(**self._effective_settings(resolve_secrets=False))
 
         self._runner = _LoopRunner()
         self._client: Any | None = None
@@ -157,64 +208,72 @@ class Neo4jMemoryStore:
 
     # ------------------------------------------------------------------ settings and connection
 
-    def _extraction_fields(self) -> dict[str, Any]:
-        return dict(self.extraction) if self.extraction is not None else {"extractor_type": "llm"}
+    @property
+    def backend(self) -> str:
+        return self.settings.get("backend") or "bolt"
 
     @property
     def is_nams(self) -> bool:
         return self.backend == "nams"
 
-    def _settings(self) -> MemorySettings:
-        """Build settings explicitly, so behaviour never depends on NAM_* variables or a local .env file."""
-        if self.is_nams:
-            api_key = self.nams_api_key.resolve_value()
-            if not api_key:
-                msg = "backend='nams' needs an API key: set NAMS_API_KEY or pass nams_api_key=Secret.from_env_var(...)."
-                raise ValueError(msg)
-            fields: dict[str, Any] = {
-                **(self.nams or {}),
-                "api_key": SecretStr(api_key),
-                "workspace_id": self.nams_workspace_id or os.environ.get("NAMS_WORKSPACE_ID"),
-            }
-            if self.nams_endpoint:
-                fields["endpoint"] = self.nams_endpoint
-            return MemorySettings(backend="nams", nams=NamsConfig(**fields))
-        return MemorySettings(
-            backend="bolt",
-            neo4j=Neo4jConfig(
-                uri=self.uri.resolve_value(),
-                username=self.username.resolve_value() or "neo4j",
-                password=SecretStr(self.password.resolve_value() or ""),
-                database=self.database_name,
-            ),
-            llm=self.llm_model,
-            embedding=self.embedding_model,
-            extraction=ExtractionConfig(**self._extraction_fields()),
-            resolution=ResolutionConfig(**(self.resolution or {})),
-            memory=MemoryConfig(**(self.memory or {})),
-        )
-
     @property
     def database_name(self) -> str:
-        """The database the store connects to: ``database``, else ``NEO4J_DATABASE``, else ``"neo4j"``."""
-        return self.database or os.environ.get("NEO4J_DATABASE") or "neo4j"
+        """The database: ``settings["neo4j"]["database"]``, else ``NEO4J_DATABASE``, else ``"neo4j"``."""
+        configured = (self.settings.get("neo4j") or {}).get("database")
+        return configured or os.environ.get("NEO4J_DATABASE") or "neo4j"
+
+    def _effective_settings(self, *, resolve_secrets: bool) -> dict[str, Any]:
+        """``settings``, with what they leave unset filled from the store's parameters and the environment."""
+        data = {k: (dict(v) if isinstance(v, dict) else v) for k, v in self.settings.items()}
+        data["backend"] = self.backend
+        if self.is_nams:
+            nams = dict(data.get("nams") or {})
+            if not _is_set(nams.get("api_key")) and resolve_secrets:
+                api_key = self.nams_api_key.resolve_value()
+                if not api_key:
+                    msg = (
+                        "backend 'nams' needs an API key: set NAMS_API_KEY or pass "
+                        "nams_api_key=Secret.from_env_var(...)."
+                    )
+                    raise ValueError(msg)
+                nams["api_key"] = SecretStr(api_key)
+            if not nams.get("workspace_id") and os.environ.get("NAMS_WORKSPACE_ID"):
+                nams["workspace_id"] = os.environ["NAMS_WORKSPACE_ID"]
+            data["nams"] = nams
+        else:
+            # Client-side defaults; NAMS embeds and extracts server-side and would warn about them.
+            data.setdefault("extraction", dict(_DEFAULT_EXTRACTION))
+            data.setdefault("embedding", _DEFAULT_EMBEDDING)
+            neo4j = dict(data.get("neo4j") or {})
+            if not neo4j.get("uri") and self.uri.resolve_value():
+                neo4j["uri"] = self.uri.resolve_value()
+            if not neo4j.get("username"):
+                neo4j["username"] = self.username.resolve_value() or "neo4j"
+            if not _is_set(neo4j.get("password")):
+                neo4j["password"] = SecretStr((self.password.resolve_value() if resolve_secrets else None) or "")
+            neo4j["database"] = self.database_name
+            data["neo4j"] = neo4j
+        return data
+
+    def _settings(self) -> MemorySettings:
+        return MemorySettings(**self._effective_settings(resolve_secrets=True))
 
     def _explain(self, error: Exception) -> Exception:
         """Turn Neo4j's permission errors on first connect into a message that says what to change."""
         text = str(error)
+        set_database = 'settings={"neo4j": {"database": ...}} or the NEO4J_DATABASE environment variable'
         if "ACCESS on database" in text:
             msg = (
                 f"Neo4j refused access to database {self.database_name!r} for this user. Set the database your user "
-                "can use with Neo4jMemoryStore(database=...) or the NEO4J_DATABASE environment variable. "
-                f"Neo4j said: {text}"
+                f"can use with {set_database}. Neo4j said: {text}"
             )
             return PermissionError(msg)
         if "IndexAlreadyExists" in text or "conflicts with existing index" in text:
             msg = (
                 f"Database {self.database_name!r} already has an index where neo4j-agent-memory needs a uniqueness "
                 "constraint, usually because another application or memory system set up its own schema there. "
-                "Use an empty database for agent memory (Neo4jMemoryStore(database=...) or NEO4J_DATABASE), or, if "
-                "nothing uses the conflicting indexes, drop them and connect again. List them with: SHOW INDEXES "
+                f"Use an empty database for agent memory ({set_database}), or, if nothing uses the conflicting "
+                "indexes, drop them and connect again. List them with: SHOW INDEXES "
                 "YIELD name, labelsOrTypes, properties, owningConstraint WHERE owningConstraint IS NULL. "
                 f"Neo4j said: {text}"
             )
@@ -229,15 +288,20 @@ class Neo4jMemoryStore:
         return error
 
     def _create_client(self) -> Any:
-        """
-        Create the ``MemoryClient``, with an embedder that embeds identical texts once.
-
-        Override in tests to inject a fake embedder or extractor.
-        """
+        """Create the ``MemoryClient``. On bolt, its embedder embeds identical texts once (see ``_SharedEmbedder``)."""
         settings = self._settings()
         if self.is_nams:  # NAMS embeds and extracts server-side
             return MemoryClient(settings)
-        return MemoryClient(settings, embedder=_SharedEmbedder(adapt_to_legacy_embedder(settings.embedding)))
+        kwargs: dict[str, Any] = {}
+        try:
+            embedder = adapt_to_legacy_embedder(self.embedder if self.embedder is not None else settings.embedding)
+            kwargs["embedder"] = _SharedEmbedder(embedder)
+        except TypeError:
+            # A legacy EmbeddingConfig: the library builds that embedder itself (without the shared-embedding cache).
+            pass
+        if self.extractor is not None:
+            kwargs["extractor"] = self.extractor
+        return MemoryClient(settings, **kwargs)
 
     async def _connected(self) -> Any:
         """The connected client. Runs on the store's loop; connects once (this creates schema and indexes)."""
@@ -568,23 +632,25 @@ class Neo4jMemoryStore:
     # ------------------------------------------------------------------ serialization
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize the store. Credentials are stored as env-var references only."""
+        """
+        Serialize the store: ``settings`` as plain data, credentials as environment-variable references only.
+
+        Raises ``ValueError`` if ``settings`` holds a secret value, or if the store was given ``embedder`` or
+        ``extractor`` objects, which cannot be saved.
+        """
+        if self.embedder is not None or self.extractor is not None:
+            msg = (
+                "A store with embedder or extractor objects cannot be saved to YAML. Configure them in settings "
+                'instead, e.g. settings={"embedding": "openai/text-embedding-3-small"}.'
+            )
+            raise ValueError(msg)
         return default_to_dict(
             self,
+            settings=_settings_to_json(self.settings),
             uri=self.uri.to_dict(),
             username=self.username.to_dict(),
             password=self.password.to_dict(),
-            database=self.database,
-            llm_model=self.llm_model,
-            embedding_model=self.embedding_model,
-            extraction=self.extraction,
-            resolution=self.resolution,
-            memory=self.memory,
-            backend=self.backend,
             nams_api_key=self.nams_api_key.to_dict(),
-            nams_workspace_id=self.nams_workspace_id,
-            nams_endpoint=self.nams_endpoint,
-            nams=self.nams,
             strict=self.strict,
         )
 
