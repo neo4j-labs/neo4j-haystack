@@ -179,25 +179,95 @@ pipe.connect("reader.messages", "llm.messages")
 pipe.connect("llm.replies", "writer.replies")
 
 query = "I focus on German AI companies. Which ones should I look at?"
+pipe.run({"query": query, "session_id": "session-1"})
+```
+
+Both components need `query` and `session_id`. Passing them at the top level, as above, sends each value to every
+component with an input of that name, so the reader and the writer both get them. To see what a pipeline needs, call
+`pipe.inputs()`; a missing one fails before anything runs, with
+`ValueError: Missing mandatory input 'session_id' for component 'reader'`.
+
+The same pipeline works with `await pipe.run_async(...)`, in scripts, servers and Jupyter: all memory calls run on one
+background event loop owned by the store.
+
+Explicit long-term writes go only to the writer, so address each component by name:
+
+```python
 pipe.run({
-    "reader": {"query": query, "session_id": "session-1"},
-    "writer": {"query": query, "session_id": "session-1"},
+    "reader": {"query": query, "session_id": "s1"},
+    "writer": {
+        "query": query, "session_id": "s1",
+        "preferences": [{"category": "region", "preference": "Focus on companies in Germany"}],
+        "facts": [{"subject": "Pravesh", "predicate": "works_at", "object": "Northwind Capital"}],
+    },
 })
 ```
 
-`query` and `session_id` go to both components, because Haystack addresses run data per component. The same
-pipeline works with `await pipe.run_async(...)`, in scripts, servers and Jupyter: all memory calls run on one
-background event loop owned by the store.
+Use one form or the other in a call. If you mix them (`{"query": ..., "session_id": ..., "writer": {...}}`),
+Haystack only logs "Inputs ['writer'] were not matched" and the writer's extra inputs are dropped.
 
-Explicit long-term writes go to the writer:
+### Backends: your Neo4j (bolt) or NAMS
+
+The store talks to memory in one of the two ways `neo4j-agent-memory` supports:
 
 ```python
-"writer": {
-    "query": query, "session_id": "s1",
-    "preferences": [{"category": "region", "preference": "Focus on companies in Germany"}],
-    "facts": [{"subject": "Pravesh", "predicate": "works_at", "object": "Northwind Capital"}],
-}
+# bolt (default): connect to your own Neo4j database directly
+store = Neo4jMemoryStore()  # NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, NEO4J_DATABASE
+
+# nams: the hosted Neo4j Agent Memory Service; memory appears in your NAMS workspace
+store = Neo4jMemoryStore(backend="nams")  # NAMS_API_KEY, NAMS_WORKSPACE_ID
+session_id = store.create_session(user_id="pravesh")  # NAMS assigns conversation ids
 ```
+
+| | `bolt` | `nams` |
+| --- | --- | --- |
+| Settings | `uri`, `username`, `password`, `database` | `nams_api_key` (`Secret`), `nams_workspace_id`, `nams_endpoint`, `nams={...}` for other `NamsConfig` fields |
+| Session ids | Any string | From `store.create_session()` |
+| Entity extraction | Your `ExtractionPolicy` | NAMS extracts server-side in the background; the policy is ignored |
+| Preferences, facts, relations | Yes | Not stored: skipped with a warning (NAMS has no endpoints for them), so the same pipeline runs on both backends |
+| Reasoning | Full traces; similar tasks are recalled | Steps and tool calls are stored per conversation; no similar-task recall |
+| Retriever reads | History, preferences, entities, facts, traces | History and entities |
+
+Don't point `bolt` at the database behind a NAMS workspace: the two use different schemas and indexes.
+
+### Save memory directly
+
+The writer saves all three memories after each chat turn. To save one kind of memory yourself (to import chat
+history, seed preferences, or record a task that ran outside a pipeline), call the store:
+
+```python
+from haystack.dataclasses import ChatMessage, ToolCall
+
+# Short-term: messages in a session (entities extracted under an ExtractionPolicy)
+store.add_messages("session-1", [
+    ChatMessage.from_user("I'm Pravesh from Northwind Capital."),
+    ChatMessage.from_assistant("Nice to meet you, Pravesh."),
+])
+
+# Long-term: preferences, facts and entities, shared across sessions
+store.add_preference("region", "Focus on companies in Germany")
+store.add_fact("Pravesh", "works_at", "Northwind Capital")
+store.add_entity("Northwind Capital", "ORGANIZATION", description="Venture capital firm")
+
+# Reasoning: a task with its tool calls and outcome (failed tasks are saved too)
+call = ToolCall(tool_name="search_companies", arguments={"country": "DE"}, id="call-1")
+store.add_trace("session-1", "Find German AI companies", [
+    ChatMessage.from_assistant(tool_calls=[call]),
+    ChatMessage.from_tool('[{"name": "Aleph Alpha", "type": "ORGANIZATION"}]', origin=call),
+    ChatMessage.from_assistant("Look at Aleph Alpha."),
+])
+```
+
+| Method | Memory | Returns |
+| --- | --- | --- |
+| `add_messages(session_id, messages, extraction_policy=, mentions=, user_id=)` | Short-term | `{"messages_written", "entities"}` |
+| `add_preference(category, preference, context=, confidence=, user_id=)` | Long-term | preference id |
+| `add_fact(subject, predicate, obj, confidence=)` | Long-term | fact id |
+| `add_entity(name, entity_type, description=, aliases=, attributes=)` | Long-term | `{"id", "name", "type", "resolution", "matched"}` |
+| `add_trace(session_id, task, messages, success=, user_id=)` | Reasoning | trace id |
+
+These methods always raise on invalid input or a failed write, also with `strict=False`. The retriever reads what
+they save in the same way as what the writer saves.
 
 ### Who decides what becomes an entity
 
@@ -271,7 +341,8 @@ stores the query and a `no_answer` trace.
 ### Configuration
 
 - `Neo4jMemoryStore(uri, username, password, database, llm_model, embedding_model, extraction, resolution, memory,
-  strict)`. Credentials are `Secret`s; `extraction`, `resolution` and `memory` are the library's
+  strict)`. Credentials are `Secret`s. `database` defaults to `NEO4J_DATABASE`, else `neo4j`: hosted and shared
+  accounts (such as Aura) often may only use their own database, so set it to that name; `extraction`, `resolution` and `memory` are the library's
   `ExtractionConfig`, `ResolutionConfig` and `MemoryConfig` fields (e.g. `memory={"multi_tenant": True}`). Settings
   are built explicitly, so `NAM_*` variables and `.env` files don't change behaviour.
 - `RecallConfig`: what the retriever reads (`read_short_term`, `read_long_term`, `read_reasoning`), limits and

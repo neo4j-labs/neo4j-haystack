@@ -7,7 +7,7 @@ name = "haystack-neo4j"
 version = "0.1.0"
 description = "Neo4j integration for Haystack: GraphRAG retrieval over existing Neo4j graphs and short-term, long-term and reasoning agent memory."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "neo4j-labs" }]
@@ -17,7 +17,6 @@ classifiers = [
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
@@ -33,8 +32,9 @@ dependencies = [
 [project.optional-dependencies]
 graphrag = ["neo4j-graphrag>=1.18"]
 # neo4j-agent-memory is pre-1.0 and changes between minors: pin the minor, widen after the tests pass.
-memory = ["neo4j-agent-memory>=0.7,<0.8"]
-memory-gliner = ["neo4j-agent-memory[gliner]>=0.7,<0.8"]
+# The `nams` extra adds httpx for backend="nams" (the hosted Neo4j Agent Memory Service).
+memory = ["neo4j-agent-memory[nams]>=0.8,<0.9"]
+memory-gliner = ["neo4j-agent-memory[nams,gliner]>=0.8,<0.9"]
 all = ["haystack-neo4j[graphrag,memory]"]
 test = ["pytest", "haystack-neo4j[all]"]
 # Only needed to run the integration tests / example notebooks with a local embedder.
@@ -57,7 +57,7 @@ markers = [
 ]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 120
 extend-exclude = ["examples", "*.md"]
 
